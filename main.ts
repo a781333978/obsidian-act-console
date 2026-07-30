@@ -4,6 +4,7 @@ import {
   ItemView,
   Modal,
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   requestUrl,
@@ -25,8 +26,16 @@ const DIDA_API_BASE = "https://api.dida365.com";
 const DIDA_PREVIEW_LIMIT = 10;
 const WEEK_IMPORTANT_HEADINGS = ["本周要事", "今日行动", "每日行动"];
 const RENDER_DEBOUNCE_MS = 350;
+// Terminal 插件（polyipseity/obsidian-terminal）的视图类型 = `${manifest.id}:${view.id}`
+const TERMINAL_VIEW_TYPE = "terminal:terminal";
+const TERMINAL_READY_TIMEOUT_MS = 8000;
+const TERMINAL_POLL_INTERVAL_MS = 150;
+const TERMINAL_NEW_LEAF_GRACE_MS = 2000;
+
 const STARTUP_RENDER_DELAY_MS = 1600;
 const STARTUP_AUTO_OPEN_DELAY_MS = 1800;
+// 手机端 Obsidian 布局就绪更晚，开屏需要多等一会儿，否则视图会被挤掉
+const MOBILE_STARTUP_AUTO_OPEN_DELAY_MS = 2400;
 const DIDA_ACTIVE_CACHE_MS = 5000;
 
 type MainTab = "focus" | "action" | "card" | "time";
@@ -130,9 +139,18 @@ interface DidaSettings {
   accessToken: string;
   lookbackDays: number;
 
+  // 以下三项自 0.3.6 起迁移到顶层 completedLog，仅为兼容旧配置保留
   completedLogTarget: CompletedLogTarget;
   completedLogPathTemplate: string;
   completedLogHeading: string;
+}
+
+// 完成账本：滴答完成、行动勾选、日志打勾三条来源统一汇入此处，工作台只读此处
+interface CompletedLogSettings {
+  target: CompletedLogTarget;
+  pathTemplate: string;
+  heading: string;
+  dailyLookbackDays: number;
 }
 
 interface ProgressLogSettings {
@@ -160,9 +178,13 @@ interface ActWorkspaceSettings {
   dvPaths: DvPaths;
   folders: FolderPaths;
   dida: DidaSettings;
+  completedLog: CompletedLogSettings;
   updateRepo: string;
   updateToken: string;
   hideCompletedNotes: boolean;
+  autoStampDoneDate: boolean;
+  openOnMobileStartup: boolean;
+  openOnDesktopStartup: boolean;
   cardVisibility: Record<string, boolean>;
   cardSearchMode: Record<string, "folder" | "tag">;
   cardTags: Record<string, string>;
@@ -180,9 +202,10 @@ const DEFAULT_FOLDERS: FolderPaths = {
   cycle: "30-Time/32-12Week-十二周",
   vision: "30-Time/31-Vision-愿景",
   card: "20-Card",
-  mainCard: "20-Card/24-MainCard-核心卡",
-  bibCard: "20-Card/23-BibCard-阅读卡",
-  indexCard: "20-Card/22-IndexCard-索引卡",
+  // 编号须与仓库实际一致：21-IndexCard / 22-BibCard / 23-MainCard
+  mainCard: "20-Card/23-MainCard-核心卡",
+  bibCard: "20-Card/22-BibCard-阅读卡",
+  indexCard: "20-Card/21-IndexCard-索引卡",
   newCard: "",
   thought: "+/ACT闪念",
   thoughtFile: "+/ACT闪念/每日闪念.md"
@@ -195,6 +218,13 @@ const DEFAULT_DIDA: DidaSettings = {
   completedLogTarget: "weekly",
   completedLogPathTemplate: "{weeklyFolder}/{weekId}.md",
   completedLogHeading: "## 每日记录"
+};
+
+const DEFAULT_COMPLETED_LOG: CompletedLogSettings = {
+  target: "weekly",
+  pathTemplate: "{weeklyFolder}/{weekId}.md",
+  heading: "## 每日记录",
+  dailyLookbackDays: 14
 };
 
 const DEFAULT_DV_PATHS: DvPaths = {
@@ -215,16 +245,21 @@ const DEFAULT_SETTINGS: ActWorkspaceSettings = {
   progressLog: { ...DEFAULT_PROGRESS_LOG },
   recentProgressLimit: 3,
   skillItems: QUICK_SKILLS.map((s) => ({ ...s })),
-  skillCommandTemplate: "cd {{vault}} && codex '{{skill}}'",
+  skillCommandTemplate: "cd {{vault}} && codex -- '{{skill}}'",
   terminalMode: "terminal",
   noteOpenMode: "split",
   cycleMode: "monthly",
   dvPaths: { ...DEFAULT_DV_PATHS },
   folders: { ...DEFAULT_FOLDERS },
   dida: { ...DEFAULT_DIDA },
+  completedLog: { ...DEFAULT_COMPLETED_LOG },
   updateRepo: "",
   updateToken: "",
   hideCompletedNotes: false,
+  autoStampDoneDate: true,
+  // 两端都默认开启，保持 0.3.5 及以前「启动即打开工作台」的既有行为
+  openOnMobileStartup: true,
+  openOnDesktopStartup: true,
   cardVisibility: { mainCard: true, bibCard: true, indexCard: true, newCard: false },
   cardSearchMode: {},
   cardTags: {},
@@ -338,6 +373,48 @@ function safeFileName(input: string): string {
   return input.trim().replace(/[\\/:*?"<>|#^[\]]/g, "").replace(/\s+/g, "-").slice(0, 48) || "未命名";
 }
 
+// 对比编辑前后的内容，给「刚从 [ ] 翻转成 [x] 且没有完成日期」的行补上 ✅ 日期。
+// 按行文本匹配而非行号，这样用户在同一次保存里增删了别的行也不会错标。
+// 跳过已有日期的行 —— 那是 Tasks 插件或工作台面板已经写好的。
+function stampNewlyCompleted(prev: string, next: string, dateStr: string): { content: string; stamped: number } {
+  const openBefore = new Set<string>();
+  for (const line of prev.split("\n")) {
+    const m = line.match(/^\s*[-*]\s*\[ \]\s*(.*)$/);
+    if (m) openBefore.add(normalizeInlineText(m[1]));
+  }
+  if (openBefore.size === 0) return { content: next, stamped: 0 };
+
+  const lines = next.split("\n");
+  let stamped = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/✅\s*\d{4}-\d{2}-\d{2}/.test(lines[i])) continue;
+    const m = lines[i].match(/^(\s*[-*]\s*\[[xX]\]\s*)(.*)$/);
+    if (!m) continue;
+    const body = m[2].replace(/\s+$/, "");
+    if (!body) continue;
+    // 编辑前它是未完成状态 → 这次刚被勾上
+    if (!openBefore.has(normalizeInlineText(body))) continue;
+    lines[i] = `${m[1]}${body} ✅ ${dateStr}`;
+    stamped++;
+  }
+  return { content: lines.join("\n"), stamped };
+}
+function isMobileRuntime(): boolean {
+  return Platform.isMobileApp || Platform.isMobile;
+}
+function isUnderFolder(path: string, folderPath: string): boolean {
+  const folder = folderPath.replace(/\/+$/, "");
+  if (!folder) return false;
+  return path === folder || path.startsWith(`${folder}/`);
+}
+function collectMarkdownFiles(folder: TFolder): TFile[] {
+  const files: TFile[] = [];
+  for (const child of folder.children) {
+    if (child instanceof TFile && child.extension === "md") files.push(child);
+    else if (child instanceof TFolder) files.push(...collectMarkdownFiles(child));
+  }
+  return files;
+}
 function normalizeInlineText(input: string): string {
   return input.replace(/-->/g, "").replace(/\s+/g, " ").trim();
 }
@@ -776,8 +853,8 @@ function insertLinesAtSectionEnd(lines: string[], sectionEnd: number, newLines: 
   lines.splice(sectionEnd, 0, ...prefixBlank, ...newLines, "");
 }
 
-function insertDidaCompletedLines(content: string, date: Date, linesToAdd: string[], headingSetting: string): { content: string; added: number } {
-  const newLines = linesToAdd.filter((line) => !content.includes(line.match(/<!--\s*(?:dida|action):[^>]+-->/)?.[0] ?? line));
+function insertCompletedLines(content: string, date: Date, linesToAdd: string[], headingSetting: string): { content: string; added: number } {
+  const newLines = linesToAdd.filter((line) => !content.includes(line.match(/<!--\s*(?:dida|action|daily):[^>]+-->/)?.[0] ?? line));
   if (newLines.length === 0) return { content, added: 0 };
 
   const lines = content.split("\n");
@@ -831,8 +908,35 @@ function countOpenTasks(tasks: WeekTask[]): number {
   return tasks.filter((task) => !task.done).length;
 }
 
+type TerminalPluginFailure = "no-command-api" | "terminal-not-opened" | "emulator-timeout";
+interface TerminalPluginResult {
+  ok: boolean;
+  reason?: TerminalPluginFailure;
+}
+
 interface ChildProcessLike {
   execFile(file: string, args: string[], callback: (error: unknown, stdout: string, stderr: string) => void): void;
+}
+
+// 从命令模板里识别所选 CLI。用词边界匹配，这样模板中带不带 `--` 都能正确识别
+function detectSkillCli(template: string): { bin: "claude" | "codex"; label: string } {
+  return /(^|\s)claude(\s|$)/.test(template)
+    ? { bin: "claude", label: "Claude Code" }
+    : { bin: "codex", label: "Codex" };
+}
+
+function describeTerminalPluginFailure(reason?: TerminalPluginFailure): string {
+  if (reason === "no-command-api") return "无法调用 Terminal 插件命令，请确认 Terminal 插件已启用。";
+  if (reason === "terminal-not-opened") {
+    return "Terminal 插件没有打开新终端。请检查该插件设置中「Add to command」是否开启。";
+  }
+  // Windows 上最常见：Terminal 插件的 pythonExecutable 默认是 python3，而 Windows 没有这个命令，
+  // resizer 以 9009（命令未找到）退出，终端起不来。
+  // 注意：该插件的设置界面并没有「Python 可执行文件」这个字段，只能改原始 JSON，所以首选建议是换终端模式
+  if (getRuntimePlatform() === "win32") {
+    return "终端已打开但未能就绪。Windows 上通常是 Terminal 插件依赖的 Python 找不到（表现为「终端缩放器意外退出：9009」）。最快的解决办法：把上方「终端模式」改为「系统终端」，该模式不需要 Python。";
+  }
+  return "终端已打开但未能就绪，请稍后重试，或改用「系统终端」模式。";
 }
 
 function getNodeRequire(): ((name: string) => unknown) | null {
@@ -862,6 +966,18 @@ interface NotePromptValue {
   priority?: string;
 }
 
+// 一条待写入完成账本的候选记录。采集阶段产出，确认后才落盘
+interface LedgerCandidate {
+  source: string;        // 滴答 / 聚焦 / 跟进 / 也许 / 日志
+  text: string;
+  dateKey: string;       // 完成日期
+  fromLabel: string;     // 来源展示名
+  fromPath: string;      // 来源文件路径（滴答来自 API，为空）
+  targetPath: string;    // 将写入的账本文件
+  line: string;          // 最终写入的整行（含去重标记）
+  legacyTags: string[];  // 兼容旧版去重标记
+}
+
 interface NotePromptOptions {
   dueDateLabel?: string;
   dueTimeLabel?: string;
@@ -869,6 +985,121 @@ interface NotePromptOptions {
   defaultDueDate?: string;
   defaultPriority?: string;
   helperText?: string;
+}
+
+// 同步确认清单：写入完成账本前，先让用户逐条过一遍
+class SyncPreviewModal extends Modal {
+  private candidates: LedgerCandidate[];
+  private selected: Set<number>;
+  private onConfirm: (chosen: LedgerCandidate[]) => void | Promise<void>;
+  private onOpenSource: (path: string) => void | Promise<void>;
+  private confirmBtn!: HTMLButtonElement;
+
+  constructor(
+    app: App,
+    candidates: LedgerCandidate[],
+    onConfirm: (chosen: LedgerCandidate[]) => void | Promise<void>,
+    onOpenSource: (path: string) => void | Promise<void>
+  ) {
+    super(app);
+    this.candidates = candidates;
+    this.selected = new Set(candidates.map((_, i) => i)); // 默认全选
+    this.onConfirm = onConfirm;
+    this.onOpenSource = onOpenSource;
+  }
+
+  onOpen() {
+    this.modalEl.addClass("act-sync-modal");
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("act-modal");
+    contentEl.createEl("h2", { text: `待同步 ${this.candidates.length} 条完成记录` });
+
+    const targets = [...new Set(this.candidates.map((c) => c.targetPath))];
+    contentEl.createDiv({
+      cls: "act-modal-helper",
+      text: targets.length === 1
+        ? `将写入：${targets[0]}`
+        : `将写入 ${targets.length} 个账本文件：${targets.join("、")}`
+    });
+
+    const toolbar = contentEl.createDiv({ cls: "act-sync-toolbar" });
+    const selectAll = toolbar.createEl("button", { text: "全选", cls: "act-sync-btn", attr: { type: "button" } });
+    const selectNone = toolbar.createEl("button", { text: "全不选", cls: "act-sync-btn", attr: { type: "button" } });
+
+    const listEl = contentEl.createDiv({ cls: "act-sync-list" });
+    const rowChecks: HTMLInputElement[] = [];
+
+    // 按来源分组展示，同组内按完成日期升序
+    const groups = new Map<string, number[]>();
+    this.candidates.forEach((c, i) => {
+      const bucket = groups.get(c.source) ?? [];
+      bucket.push(i);
+      groups.set(c.source, bucket);
+    });
+
+    for (const [source, indexes] of groups) {
+      const groupEl = listEl.createDiv({ cls: "act-sync-group" });
+      groupEl.createDiv({ cls: "act-sync-group-title", text: `${source}  ·  ${indexes.length} 条` });
+      indexes.sort((a, b) => this.candidates[a].dateKey.localeCompare(this.candidates[b].dateKey));
+
+      for (const i of indexes) {
+        const candidate = this.candidates[i];
+        const row = groupEl.createDiv({ cls: "act-sync-row" });
+        const check = row.createEl("input", { type: "checkbox", cls: "act-sync-check" });
+        check.checked = true;
+        check.addEventListener("change", () => {
+          if (check.checked) this.selected.add(i);
+          else this.selected.delete(i);
+          this.updateConfirmLabel();
+        });
+        rowChecks.push(check);
+
+        const main = row.createDiv({ cls: "act-sync-row-main" });
+        main.createDiv({ text: candidate.text, cls: "act-sync-row-text" });
+        const meta = main.createDiv({ cls: "act-sync-row-meta" });
+        meta.createSpan({ text: candidate.dateKey, cls: "act-sync-row-date" });
+        if (candidate.fromPath) {
+          const link = meta.createEl("a", { text: candidate.fromLabel, cls: "act-sync-row-from", href: "#" });
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            void this.onOpenSource(candidate.fromPath);
+          });
+        } else {
+          meta.createSpan({ text: candidate.fromLabel, cls: "act-sync-row-from is-external" });
+        }
+      }
+    }
+
+    const setAll = (value: boolean) => {
+      this.selected = value ? new Set(this.candidates.map((_, i) => i)) : new Set();
+      for (const check of rowChecks) check.checked = value;
+      this.updateConfirmLabel();
+    };
+    selectAll.addEventListener("click", () => setAll(true));
+    selectNone.addEventListener("click", () => setAll(false));
+
+    const footer = contentEl.createDiv({ cls: "act-sync-footer" });
+    this.confirmBtn = footer.createEl("button", { cls: "act-sync-confirm mod-cta", attr: { type: "button" } });
+    this.updateConfirmLabel();
+    this.confirmBtn.addEventListener("click", async () => {
+      const chosen = this.candidates.filter((_, i) => this.selected.has(i));
+      this.close();
+      await this.onConfirm(chosen);
+    });
+    const cancelBtn = footer.createEl("button", { text: "取消", cls: "act-sync-btn", attr: { type: "button" } });
+    cancelBtn.addEventListener("click", () => this.close());
+  }
+
+  private updateConfirmLabel() {
+    const count = this.selected.size;
+    this.confirmBtn.setText(count > 0 ? `写入 ${count} 条` : "未选择任何条目");
+    this.confirmBtn.disabled = count === 0;
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
 }
 
 class NotePromptModal extends Modal {
@@ -1080,16 +1311,16 @@ class ActWorkspaceView extends ItemView {
     this.requestRender(STARTUP_RENDER_DELAY_MS);
     this.startRefreshInterval();
     this.registerEvent(this.app.vault.on("modify", (file) => {
-      if (file instanceof TFile && this.isCycleNotePath(file.path)) this.requestRender();
+      if (file instanceof TFile && this.isWatchedPath(file.path)) this.requestRender();
     }));
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (this.isCycleNotePath(file.path)) this.requestRender();
+      if (this.isWatchedPath(file.path)) this.requestRender();
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (this.isCycleNotePath(file.path)) this.requestRender();
+      if (this.isWatchedPath(file.path)) this.requestRender();
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      if (this.isCycleNotePath(file.path) || this.isCycleNotePath(oldPath)) this.requestRender();
+      if (this.isWatchedPath(file.path) || this.isWatchedPath(oldPath)) this.requestRender();
     }));
   }
 
@@ -1124,9 +1355,20 @@ class ActWorkspaceView extends ItemView {
     }
   }
 
+  private isDailyLedger(): boolean {
+    return this.plugin.isDailyLogTheLedger();
+  }
+
   private isCycleNotePath(path: string): boolean {
-    const folder = this.F.cycle.replace(/\/+$/, "");
-    return path === folder || path.startsWith(`${folder}/`);
+    return isUnderFolder(path, this.F.cycle);
+  }
+
+  // 工作台展示的所有数据源都要触发重渲染，否则在编辑器里勾一个复选框，面板不会更新
+  private isWatchedPath(path: string): boolean {
+    // 自定义账本可能落在任意路径，单独按精确路径匹配
+    if (path === this.plugin.resolveCompletedLogPath(new Date())) return true;
+    return [this.F.cycle, this.F.weekly, this.F.daily, this.F.focusAction, this.F.activeAction, this.F.maybeAction, this.F.thought]
+      .some((folder) => isUnderFolder(path, folder));
   }
 
   private requestRender(delay = RENDER_DEBOUNCE_MS) {
@@ -1358,30 +1600,57 @@ class ActWorkspaceView extends ItemView {
     const section = this.section(container, "今日已完成", "聚焦 · 完成");
     const today = new Date();
     const todayStr = formatDateOnly(today);
-    const weekId = formatWeekId(today);
-    const weekPath = `${this.F.weekly}/${weekId}.md`;
-    this.smallAction(section, "本周完成", async () => {
-      await this.plugin.ensureWeeklyFile(weekId);
-      await this.plugin.openPath(weekPath);
+    // 读取目标跟随「完成记录汇聚位置」设置，不再硬编码周记
+    const ledgerPath = this.plugin.resolveCompletedLogPath(today);
+
+    const btnGroup = section.createDiv({ cls: "act-action-btn-group" });
+    const openBtn = btnGroup.createEl("button", { text: "打开账本", cls: "act-small-action", attr: { type: "button" } });
+    openBtn.addEventListener("click", async () => {
+      await this.plugin.ensureCompletedLogFileForDate(today);
+      await this.plugin.openPath(ledgerPath);
     });
+    const syncBtn = btnGroup.createEl("button", { text: "任务更新", cls: "act-small-action is-sync-accent", attr: { type: "button" } });
+    syncBtn.addEventListener("click", async () => {
+      syncBtn.disabled = true;
+      try {
+        this.invalidateDidaActiveCache();
+        await this.plugin.reviewAndCommitCandidates(await this.plugin.collectPendingCandidates(), () => this.render());
+      } catch (error) {
+        console.error("任务更新失败", error);
+        new Notice(`同步失败：${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        syncBtn.disabled = false;
+      }
+    });
+
+    const sources = ["行动文件夹勾选", this.plugin.settings.dida.enabled ? "滴答清单完成" : null, this.isDailyLedger() ? null : "日志内勾选"]
+      .filter((s): s is string => s !== null)
+      .join(" / ");
     this.sectionInfo(section, {
-      source: weekPath,
-      rule: "统一从周记读取。点击滴答清单区域的「任务更新」按钮可同步滴答清单 + 行动文件夹的完成记录到周记。来源识别：滴答清单：→ 滴答；聚焦/跟进/也许：→ 对应行动来源；其他 → 计划。"
+      source: ledgerPath,
+      rule: `只读完成账本（${this.plugin.describeCompletedLogTarget()}），汇聚位置可在设置 → 行动 → 完成记录中修改。来源：${sources}，点「任务更新」汇入（勾选行动项时会自动汇入）。${this.isDailyLedger() ? "当前账本就是日志本身，故不再做日志提炼。" : ""}来源标签：滴答清单：→ 滴答；聚焦/跟进/也许：→ 对应行动来源；日志：→ 日志；其他 → 计划。`
     });
 
     const completed: { text: string; source: string }[] = [];
 
-    const weekFile = this.app.vault.getAbstractFileByPath(weekPath);
-    if (weekFile instanceof TFile) {
-      const content = await this.app.vault.cachedRead(weekFile);
+    const ledgerFile = this.app.vault.getAbstractFileByPath(ledgerPath);
+    if (ledgerFile instanceof TFile) {
+      // 直读单个账本文件：同步刚写完就重渲染，cachedRead 可能还是旧内容
+      const content = await this.app.vault.read(ledgerFile);
+      // 账本是今日日志时，文件本身已限定日期：手动打勾的行不带 ✅ 日期，也要算今天
+      const dateAgnostic = this.isDailyLedger();
       for (const line of content.split("\n")) {
-        if (/^\s*-\s*\[x\]/i.test(line) && line.includes(todayStr)) {
+        if (/^\s*-\s*\[x\]/i.test(line) && (dateAgnostic || line.includes(todayStr))) {
           let text = line.replace(/^\s*-\s*\[x\]\s*/i, "").replace(/<!--.*?-->/g, "").replace(/\s*✅\s*\d{4}-\d{2}-\d{2}/, "").trim();
           const isDida = text.startsWith("滴答清单：") || text.startsWith("滴答清单:");
+          const isDaily = /^日志[：:]/.test(text);
           const actionMatch = text.match(/^(聚焦|跟进|也许)[：:]/);
           if (isDida) {
             text = text.replace(/^滴答清单[：:]/, "").trim();
             completed.push({ text, source: "滴答" });
+          } else if (isDaily) {
+            text = text.replace(/^日志[：:]/, "").trim();
+            completed.push({ text, source: "日志" });
           } else if (actionMatch) {
             text = text.replace(/^(?:聚焦|跟进|也许)[：:]/, "").trim();
             completed.push({ text, source: actionMatch[1] });
@@ -1398,7 +1667,7 @@ class ActWorkspaceView extends ItemView {
     }
 
     section.createDiv({ text: `今日完成 ${completed.length} 项`, cls: "act-hint" });
-    const sourceClsMap: Record<string, string> = { "滴答": "is-dida", "计划": "is-plan", "聚焦": "is-focus", "跟进": "is-active", "也许": "is-maybe" };
+    const sourceClsMap: Record<string, string> = { "滴答": "is-dida", "计划": "is-plan", "聚焦": "is-focus", "跟进": "is-active", "也许": "is-maybe", "日志": "is-daily" };
     for (const item of completed) {
       const row = section.createDiv({ cls: "act-completed-row" });
       row.createSpan({ text: "✓", cls: "act-completed-check" });
@@ -1871,25 +2140,9 @@ class ActWorkspaceView extends ItemView {
     const actions = section.createDiv({ cls: "act-dida-header-actions" });
     this.didaToolButton(actions, "新增任务", "plus", () => this.plugin.captureDidaTask());
     this.didaToolButton(actions, "打开滴答清单", "external-link", () => window.open(DIDA_WEB_URL, "_blank"));
-    this.didaToolButton(actions, "任务更新", "refresh-cw", async () => {
-      try {
-        this.invalidateDidaActiveCache();
-        const didaAdded = await this.plugin.syncCompletedDidaToWeekly({ silent: true });
-        const actionResult = await this.plugin.syncActionCompletedToWeekly();
-        const parts: string[] = [];
-        if (didaAdded > 0) parts.push(`滴答 ${didaAdded} 条`);
-        if (actionResult.today > 0) parts.push(`行动 ${actionResult.today} 条`);
-        if (actionResult.backfill > 0) parts.push(`补录历史 ${actionResult.backfill} 条`);
-        new Notice(parts.length > 0 ? `已同步完成记录：${parts.join("、")}` : "已更新，无新增完成记录");
-      } catch (error) {
-        console.error("任务更新失败", error);
-        new Notice(`同步失败：${error instanceof Error ? error.message : String(error)}`);
-      }
-      await this.render();
-    });
     this.sectionInfo(section, {
       source: "滴答清单 Open API（设置中配置 Access Token）",
-      rule: `今日任务 = dueDate 为今天；未安排任务 = 无 dueDate 或已超期。点击「任务更新」按钮可将完成记录同步到周记。按优先级降序、截止日期升序排列。`,
+      rule: `今日任务 = dueDate 为今天；未安排任务 = 无 dueDate 或已超期。完成记录的同步入口已移到「今日已完成」区域的「任务更新」按钮（不启用滴答清单也能用）。按优先级降序、截止日期升序排列。`,
       props: [
         { name: "priority", desc: "0=无, 1=低, 3=中, 5=高" },
         { name: "dueDate", desc: "任务截止日期" },
@@ -2757,6 +3010,8 @@ export default class ActWorkspacePlugin extends Plugin {
   settings: ActWorkspaceSettings = DEFAULT_SETTINGS;
   get F() { return this.settings.folders; }
   private completedDidaSyncing = false;
+  private actionNoteSnapshots = new Map<string, string>();
+  private stampingPaths = new Set<string>();
   private themeStyleEl: HTMLStyleElement | null = null;
 
   async onload() {
@@ -2770,11 +3025,77 @@ export default class ActWorkspacePlugin extends Plugin {
       name: "打开 ACT 工作台",
       callback: () => this.activateView()
     });
+    this.registerDoneDateStamping();
     this.app.workspace.onLayoutReady(() => {
+      if (!this.shouldOpenOnStartup()) return;
+      const delay = isMobileRuntime() ? MOBILE_STARTUP_AUTO_OPEN_DELAY_MS : STARTUP_AUTO_OPEN_DELAY_MS;
       window.setTimeout(() => {
         void this.activateView();
-      }, STARTUP_AUTO_OPEN_DELAY_MS);
+      }, delay);
     });
+  }
+
+  private shouldOpenOnStartup(): boolean {
+    if (isMobileRuntime()) return this.settings.openOnMobileStartup;
+    return this.settings.openOnDesktopStartup;
+  }
+
+  // 在任务笔记里直接点复选框时，Obsidian 原生只把 [ ] 改成 [x]，不写完成日期，
+  // 于是这条记录永远进不了完成账本。这里补上日期，行为与工作台面板内勾选对齐。
+  // 与 Tasks 插件互补：只处理「本次编辑中刚翻转、且这一行没有日期」的项；Tasks 已写过日期的直接跳过。
+  private registerDoneDateStamping() {
+    // 快照用于逐行 diff。没有快照时只记录、不改写——宁可漏标，也不把历史遗留的裸勾误标成今天
+    this.registerEvent(this.app.workspace.on("file-open", (file) => {
+      if (file && this.isActionNotePath(file.path)) void this.snapshotActionNote(file);
+    }));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file instanceof TFile && this.isActionNotePath(file.path)) void this.handleActionNoteModify(file);
+    }));
+    const active = this.app.workspace.getActiveFile();
+    if (active && this.isActionNotePath(active.path)) void this.snapshotActionNote(active);
+  }
+
+  private isActionNotePath(path: string): boolean {
+    if (!path.endsWith(".md")) return false;
+    return [this.F.focusAction, this.F.activeAction, this.F.maybeAction].some((folder) => isUnderFolder(path, folder));
+  }
+
+  private async snapshotActionNote(file: TFile) {
+    try {
+      this.actionNoteSnapshots.set(file.path, await this.app.vault.read(file));
+    } catch (error) {
+      console.error("[ACT] 读取任务笔记快照失败", error);
+    }
+  }
+
+  private async handleActionNoteModify(file: TFile) {
+    if (!this.settings.autoStampDoneDate) return;
+    if (this.stampingPaths.has(file.path)) return; // 跳过本插件自己写入触发的事件
+
+    let next: string;
+    try {
+      next = await this.app.vault.read(file);
+    } catch {
+      return;
+    }
+    const prev = this.actionNoteSnapshots.get(file.path);
+    this.actionNoteSnapshots.set(file.path, next);
+    if (prev === undefined || prev === next) return;
+
+    const dateStr = formatDateOnly(new Date());
+    const { content, stamped } = stampNewlyCompleted(prev, next, dateStr);
+    if (stamped === 0) return;
+
+    this.stampingPaths.add(file.path);
+    try {
+      await this.app.vault.modify(file, content);
+      this.actionNoteSnapshots.set(file.path, content);
+      new Notice(`已记完成日期 ✅ ${dateStr}${stamped > 1 ? `（${stamped} 项）` : ""}，点「任务更新」入账`);
+    } catch (error) {
+      console.error("[ACT] 补写完成日期失败", error);
+    } finally {
+      this.stampingPaths.delete(file.path);
+    }
   }
 
   onunload() {
@@ -2798,6 +3119,20 @@ export default class ActWorkspacePlugin extends Plugin {
       else if (template === "{weeklyFolder}/{weekId}.md") this.settings.dida.completedLogTarget = "weekly";
       else this.settings.dida.completedLogTarget = "custom";
     }
+    // 0.3.6：完成记录配置从 dida 分组升格为顶层 completedLog。老配置静默迁移一次，不丢用户设置
+    this.settings.completedLog = Object.assign({}, DEFAULT_COMPLETED_LOG, saved?.completedLog);
+    if (!saved?.completedLog && saved?.dida) {
+      this.settings.completedLog.target = this.settings.dida.completedLogTarget;
+      this.settings.completedLog.pathTemplate = this.settings.dida.completedLogPathTemplate;
+      this.settings.completedLog.heading = this.settings.dida.completedLogHeading;
+    }
+    if (!["weekly", "daily", "custom"].includes(this.settings.completedLog.target)) {
+      this.settings.completedLog.target = DEFAULT_COMPLETED_LOG.target;
+    }
+    this.settings.completedLog.dailyLookbackDays = Math.max(
+      0,
+      Math.min(90, Number(this.settings.completedLog.dailyLookbackDays) || DEFAULT_COMPLETED_LOG.dailyLookbackDays)
+    );
     this.settings.cardSearchMode = Object.assign({}, saved?.cardSearchMode);
     this.settings.cardTags = Object.assign({}, saved?.cardTags);
     this.settings.progressLog = Object.assign({}, DEFAULT_PROGRESS_LOG, saved?.progressLog);
@@ -3042,14 +3377,15 @@ export default class ActWorkspacePlugin extends Plugin {
     return [];
   }
 
-  async syncCompletedDidaToWeekly(options: { silent?: boolean } = {}): Promise<number> {
-    if (this.completedDidaSyncing) return 0;
+  // 来源 1：滴答清单已完成任务 → 候选条目
+  async collectDidaCandidates(options: { silent?: boolean } = {}): Promise<LedgerCandidate[]> {
+    if (this.completedDidaSyncing) return [];
     this.completedDidaSyncing = true;
     try {
       const token = await this.getDidaApiToken();
       if (!token) {
         if (!options.silent) new Notice("滴答清单 Access Token 不可用");
-        return 0;
+        return [];
       }
       const until = new Date();
       until.setHours(23, 59, 59, 999);
@@ -3057,146 +3393,200 @@ export default class ActWorkspacePlugin extends Plugin {
       since.setDate(since.getDate() - this.settings.dida.lookbackDays);
       since.setHours(0, 0, 0, 0);
       const completedTasks = await this.fetchCompletedDidaTasks(token, since, until);
-      let addedTotal = 0;
-      const tasksByFile = new Map<string, { weekId: string; tasks: DidaTask[] }>();
-      for (const task of completedTasks) {
+      const candidates: LedgerCandidate[] = [];
+      for (const task of completedTasks.sort((a, b) => (a.completedTime ?? "").localeCompare(b.completedTime ?? ""))) {
         const completedAt = new Date(task.completedTime ?? "");
         if (Number.isNaN(completedAt.getTime())) continue;
-        const weekId = formatWeekId(completedAt);
-        const targetPath = this.resolveDidaCompletedLogPath(completedAt);
-        const bucket = tasksByFile.get(targetPath) ?? { weekId, tasks: [] };
-        bucket.tasks.push(task);
-        tasksByFile.set(targetPath, bucket);
+        const dateKey = formatDateOnly(completedAt);
+        const text = normalizeInlineText(task.title);
+        candidates.push({
+          source: "滴答",
+          text,
+          dateKey,
+          fromLabel: "滴答清单 API",
+          fromPath: "",
+          targetPath: this.resolveCompletedLogPath(completedAt),
+          line: `- [x] 滴答清单：${text} ✅ ${dateKey} <!-- dida:${task.id} -->`,
+          legacyTags: []
+        });
       }
-
-      for (const [targetPath, bucket] of tasksByFile) {
-        const file = await this.ensureDidaCompletedLogFile(targetPath, bucket.weekId);
-        let content = await this.app.vault.cachedRead(file);
-        let addedForFile = 0;
-        const tasksByDate = new Map<string, DidaTask[]>();
-        for (const task of bucket.tasks) {
-          const dateKey = formatDateOnly(new Date(task.completedTime ?? ""));
-          const bucket = tasksByDate.get(dateKey) ?? [];
-          bucket.push(task);
-          tasksByDate.set(dateKey, bucket);
-        }
-        for (const [dateKey, dateTasks] of tasksByDate) {
-          const date = new Date(`${dateKey}T12:00:00`);
-          const lines = dateTasks
-            .sort((a, b) => (a.completedTime ?? "").localeCompare(b.completedTime ?? ""))
-            .map((task) => `- [x] 滴答清单：${normalizeInlineText(task.title)} ✅ ${dateKey} <!-- dida:${task.id} -->`);
-          const result = insertDidaCompletedLines(content, date, lines, this.settings.dida.completedLogHeading);
-          content = result.content;
-          addedForFile += result.added;
-          addedTotal += result.added;
-        }
-        if (addedForFile > 0) await this.app.vault.modify(file, content);
-      }
-      return addedTotal;
+      return candidates;
     } catch (error) {
-      console.error("Failed to sync completed Dida tasks", error);
-      if (!options.silent) new Notice("同步滴答清单完成任务失败，请查看开发者控制台");
-      return 0;
+      console.error("Failed to collect completed Dida tasks", error);
+      if (!options.silent) new Notice("读取滴答清单完成任务失败，请查看开发者控制台");
+      return [];
     } finally {
       this.completedDidaSyncing = false;
     }
   }
 
-  async syncActionCompletedToWeekly(): Promise<{ today: number; backfill: number }> {
+  // 来源 2：行动文件夹里已勾选的行动项 → 候选条目
+  async collectActionCandidates(): Promise<LedgerCandidate[]> {
     const actionFolders = [
       { path: this.F.focusAction, label: "聚焦" },
       { path: this.F.activeAction, label: "跟进" },
       { path: this.F.maybeAction, label: "也许" },
     ];
-    const itemsByDate = new Map<string, { text: string; noteBasename: string; source: string; dateKey: string }[]>();
+    const candidates: LedgerCandidate[] = [];
 
     for (const af of actionFolders) {
       const folder = this.app.vault.getAbstractFileByPath(af.path);
       if (!(folder instanceof TFolder)) continue;
-      for (const child of folder.children) {
-        if (!(child instanceof TFile) || child.extension !== "md") continue;
+      for (const child of collectMarkdownFiles(folder)) {
+        // 用 read 而非 cachedRead：勾选行动项后会立即调用本方法，cachedRead 可能还是旧内容
         const content = await this.app.vault.read(child);
         for (const line of content.split("\n")) {
           const doneMatch = line.match(/^\s*[-*]\s*\[[xX]\].*✅\s*(\d{4}-\d{2}-\d{2})/);
           if (!doneMatch) continue;
           const dateKey = doneMatch[1];
-          const text = line
+          const raw = line
             .replace(/^\s*[-*]\s*\[[xX]\]\s*/, "")
             .replace(/[!！]{1,3}\s*/g, "")
             .replace(/\s*✅\s*\d{4}-\d{2}-\d{2}.*$/, "")
             .trim();
-          if (!text) continue;
-          const bucket = itemsByDate.get(dateKey) ?? [];
-          bucket.push({ text, noteBasename: child.basename, source: af.label, dateKey });
-          itemsByDate.set(dateKey, bucket);
+          if (!raw) continue;
+          const text = normalizeInlineText(raw);
+          const tagId = `${child.basename}::${text}`.replace(/[<>]/g, "");
+          // 兼容旧版 30 字符截断的去重标签，避免历史条目被重复同步
+          const legacyTagId = `${child.basename}::${text.slice(0, 30)}`.replace(/[<>]/g, "");
+          candidates.push({
+            source: af.label,
+            text,
+            dateKey,
+            fromLabel: child.basename,
+            fromPath: child.path,
+            targetPath: this.resolveCompletedLogPath(new Date(`${dateKey}T12:00:00`)),
+            line: `- [x] ${af.label}：${text}（${child.basename}） ✅ ${dateKey} <!-- action:${tagId} -->`,
+            legacyTags: [`<!-- action:${legacyTagId} -->`]
+          });
         }
       }
     }
+    return candidates;
+  }
 
+  // 来源 3：日志里手动勾选的复选框 → 候选条目
+  // 账本本身就是日志时跳过（否则自己写自己，会把日志原有勾选复制一份回去）
+  async collectDailyLogCandidates(): Promise<LedgerCandidate[]> {
+    if (this.isDailyLogTheLedger()) return [];
+    const folder = this.app.vault.getAbstractFileByPath(this.F.daily);
+    if (!(folder instanceof TFolder)) return [];
+
+    const earliest = new Date();
+    earliest.setHours(0, 0, 0, 0);
+    earliest.setDate(earliest.getDate() - this.settings.completedLog.dailyLookbackDays);
+
+    const candidates: LedgerCandidate[] = [];
+    for (const child of collectMarkdownFiles(folder)) {
+      // 日期取自文件名（2026-06-15（周一）.md），日志里手动打勾不会自带 ✅ 日期
+      const dateKey = child.basename.match(/^(\d{4}-\d{2}-\d{2})/)?.[1];
+      if (!dateKey) continue;
+      const date = new Date(`${dateKey}T12:00:00`);
+      if (Number.isNaN(date.getTime()) || date < earliest) continue;
+
+      const content = await this.app.vault.read(child);
+      for (const line of content.split("\n")) {
+        if (!/^\s*[-*]\s*\[[xX]\]/.test(line)) continue;
+        // 已带同步标记的行是别处汇入的，不能再回流一次
+        if (/<!--\s*(?:action|dida|daily):/.test(line)) continue;
+        const text = normalizeInlineText(
+          line
+            .replace(/^\s*[-*]\s*\[[xX]\]\s*/, "")
+            .replace(/[!！]{1,3}\s*/g, "")
+            .replace(/\s*✅\s*\d{4}-\d{2}-\d{2}\s*/, " ")
+            .trim()
+        );
+        if (!text) continue;
+        const tagId = `${dateKey}::${text}`.replace(/[<>]/g, "");
+        candidates.push({
+          source: "日志",
+          text,
+          dateKey,
+          fromLabel: child.basename,
+          fromPath: child.path,
+          targetPath: this.resolveCompletedLogPath(date),
+          line: `- [x] 日志：${text} ✅ ${dateKey} <!-- daily:${tagId} -->`,
+          legacyTags: []
+        });
+      }
+    }
+    return candidates;
+  }
+
+  // 采集阶段的收口：剔除账本里已存在的，以及本批次内部的重复
+  // 不做这一步，每次点「任务更新」都会把历史上同步过的全部列出来
+  async filterPendingCandidates(candidates: LedgerCandidate[]): Promise<LedgerCandidate[]> {
+    const contentCache = new Map<string, string>();
+    const seenTags = new Set<string>();
+    const pending: LedgerCandidate[] = [];
+
+    for (const candidate of candidates) {
+      if (!contentCache.has(candidate.targetPath)) {
+        const file = this.app.vault.getAbstractFileByPath(candidate.targetPath);
+        contentCache.set(candidate.targetPath, file instanceof TFile ? await this.app.vault.read(file) : "");
+      }
+      const content = contentCache.get(candidate.targetPath) ?? "";
+      const primaryTag = candidate.line.match(/<!--\s*(?:dida|action|daily):[^>]+-->/)?.[0] ?? candidate.line;
+      const batchKey = JSON.stringify([candidate.targetPath, primaryTag]);
+      if (seenTags.has(batchKey)) continue;
+      if (content.includes(primaryTag)) continue;
+      if (candidate.legacyTags.some((tag) => content.includes(tag))) continue;
+      seenTags.add(batchKey);
+      pending.push(candidate);
+    }
+    return pending;
+  }
+
+  // 采集：三条来源合并 + 过滤，得到「待确认」清单。includeDida 为 false 时不发网络请求
+  async collectPendingCandidates(options: { includeDida?: boolean } = {}): Promise<LedgerCandidate[]> {
+    const includeDida = options.includeDida !== false && this.settings.dida.enabled;
+    const all: LedgerCandidate[] = [
+      ...(includeDida ? await this.collectDidaCandidates({ silent: true }) : []),
+      ...(await this.collectActionCandidates()),
+      ...(await this.collectDailyLogCandidates())
+    ];
+    return await this.filterPendingCandidates(all);
+  }
+
+  // 写入：把用户确认后的条目落盘。按目标文件 + 完成日期分组，交给 insertCompletedLines 定位标题
+  async commitCandidates(candidates: LedgerCandidate[]): Promise<{ today: number; backfill: number }> {
     const todayStr = formatDateOnly(new Date());
+    const byTarget = new Map<string, Map<string, LedgerCandidate[]>>();
+    for (const candidate of candidates) {
+      const byDate = byTarget.get(candidate.targetPath) ?? new Map<string, LedgerCandidate[]>();
+      const bucket = byDate.get(candidate.dateKey) ?? [];
+      bucket.push(candidate);
+      byDate.set(candidate.dateKey, bucket);
+      byTarget.set(candidate.targetPath, byDate);
+    }
+
     let todayCount = 0;
     let backfillCount = 0;
 
-    for (const [dateKey, items] of itemsByDate) {
-      const date = new Date(`${dateKey}T12:00:00`);
-      const weekId = formatWeekId(date);
-      const file = await this.ensureWeeklyFile(weekId);
-      const content = await this.app.vault.read(file);
+    for (const [targetPath, byDate] of byTarget) {
+      // 同一文件内多个日期共用一次读写，避免后一个日期覆盖前一个的写入
+      const anyDateKey = byDate.keys().next().value as string;
+      const file = await this.ensureCompletedLogFile(targetPath, formatWeekId(new Date(`${anyDateKey}T12:00:00`)));
+      let content = await this.app.vault.read(file);
+      let changed = false;
 
-      const newEntries: string[] = [];
-      for (const item of items) {
-        const tagId = `${item.noteBasename}::${item.text}`.replace(/[<>]/g, "");
-        const commentTag = `<!-- action:${tagId} -->`;
-        // 兼容旧版 30 字符截断的去重标签，避免历史条目被重复同步
-        const legacyTagId = `${item.noteBasename}::${item.text.slice(0, 30)}`.replace(/[<>]/g, "");
-        const legacyCommentTag = `<!-- action:${legacyTagId} -->`;
-        if (content.includes(commentTag) || content.includes(legacyCommentTag)) continue;
-        newEntries.push(`- [x] ${item.source}：${item.text}（${item.noteBasename}） ✅ ${dateKey} ${commentTag}`);
-      }
-      if (newEntries.length === 0) continue;
-
-      const dayHeading = formatWeeklyLogHeading(date);
-      const lines = content.split("\n");
-      let inserted = false;
-
-      for (let i = 0; i < lines.length; i++) {
-        if (/^###\s+/.test(lines[i]) && lines[i].includes(dayHeading)) {
-          let end = i + 1;
-          while (end < lines.length && !/^#{1,3}\s+/.test(lines[end])) end++;
-          const insertAt = lines[end - 1]?.trim() === "" ? end - 1 : end;
-          lines.splice(insertAt, 0, ...newEntries, "");
-          inserted = true;
-          break;
-        }
+      for (const [dateKey, bucket] of byDate) {
+        const date = new Date(`${dateKey}T12:00:00`);
+        const result = insertCompletedLines(content, date, bucket.map((c) => c.line), this.settings.completedLog.heading);
+        if (result.added === 0) continue;
+        content = result.content;
+        changed = true;
+        if (dateKey === todayStr) todayCount += result.added;
+        else backfillCount += result.added;
       }
 
-      if (!inserted) {
-        let dailyHeadingIdx = -1;
-        for (let i = 0; i < lines.length; i++) {
-          if (/^##\s+每日记录/.test(lines[i])) { dailyHeadingIdx = i; break; }
-        }
-        if (dailyHeadingIdx === -1) {
-          lines.push("", "## 每日记录", "");
-          dailyHeadingIdx = lines.length - 2;
-        }
-        let sectionEnd = dailyHeadingIdx + 1;
-        while (sectionEnd < lines.length && !/^#{1,2}\s+/.test(lines[sectionEnd])) sectionEnd++;
-        const dayBlock = [`### ${dayHeading}`, "", ...newEntries, ""];
-        lines.splice(sectionEnd, 0, ...dayBlock);
-        inserted = true;
-      }
-
-      if (inserted) {
-        await this.app.vault.modify(file, lines.join("\n"));
-        if (dateKey === todayStr) todayCount += newEntries.length;
-        else backfillCount += newEntries.length;
-      }
+      if (changed) await this.app.vault.modify(file, content);
     }
 
     return { today: todayCount, backfill: backfillCount };
   }
 
-  private resolveDidaCompletedLogPath(date: Date): string {
+  resolveCompletedLogPath(date: Date): string {
     const template = this.getCompletedLogPathTemplate();
     const rendered = renderDidaLogTemplate(
       template
@@ -3208,20 +3598,31 @@ export default class ActWorkspacePlugin extends Plugin {
   }
 
   private getCompletedLogPathTemplate(): string {
-    if (this.settings.dida.completedLogTarget === "daily") return "{dailyFolder}/{dailyDate}.md";
-    if (this.settings.dida.completedLogTarget === "custom") {
-      return this.settings.dida.completedLogPathTemplate?.trim() || DEFAULT_DIDA.completedLogPathTemplate;
+    if (this.settings.completedLog.target === "daily") return "{dailyFolder}/{dailyDate}.md";
+    if (this.settings.completedLog.target === "custom") {
+      return this.settings.completedLog.pathTemplate?.trim() || DEFAULT_COMPLETED_LOG.pathTemplate;
     }
     return "{weeklyFolder}/{weekId}.md";
   }
 
   describeCompletedLogTarget(): string {
-    if (this.settings.dida.completedLogTarget === "daily") return "每日日志（按完成日期写入对应日志）";
-    if (this.settings.dida.completedLogTarget === "custom") return `自定义笔记（${this.settings.dida.completedLogPathTemplate || DEFAULT_DIDA.completedLogPathTemplate}）`;
+    if (this.settings.completedLog.target === "daily") return "每日日志（按完成日期写入对应日志）";
+    if (this.settings.completedLog.target === "custom") return `自定义笔记（${this.settings.completedLog.pathTemplate || DEFAULT_COMPLETED_LOG.pathTemplate}）`;
     return "每周周记（按完成日期写入对应周记）";
   }
 
-  private async ensureDidaCompletedLogFile(path: string, weekId: string): Promise<TFile> {
+  // 账本 = 日志时，「日志 → 账本」等于自己写自己，必须关闭该来源，否则会把日志原有的勾选复制一份回自己
+  // 不能只看 target：自定义模板也可能指回日志文件夹（例如手填 {dailyFolder}/{dailyDate}.md），故按解析后的实际路径判断
+  isDailyLogTheLedger(): boolean {
+    if (this.settings.completedLog.target === "daily") return true;
+    return isUnderFolder(this.resolveCompletedLogPath(new Date()), this.F.daily);
+  }
+
+  async ensureCompletedLogFileForDate(date: Date): Promise<TFile> {
+    return await this.ensureCompletedLogFile(this.resolveCompletedLogPath(date), formatWeekId(date));
+  }
+
+  private async ensureCompletedLogFile(path: string, weekId: string): Promise<TFile> {
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing instanceof TFile) return existing;
 
@@ -3233,7 +3634,7 @@ export default class ActWorkspacePlugin extends Plugin {
     await this.app.vault.create(path, "");
     const created = this.app.vault.getAbstractFileByPath(path);
     if (created instanceof TFile) return created;
-    throw new Error(`Failed to create Dida completed log: ${path}`);
+    throw new Error(`Failed to create completed log: ${path}`);
   }
 
   private async ensureVaultFolder(path: string) {
@@ -3416,11 +3817,55 @@ export default class ActWorkspacePlugin extends Plugin {
       changed = next !== content;
       return next;
     });
-    if (changed) {
-      new Notice("行动项已完成");
-    } else {
+    if (!changed) {
       new Notice("行动项已经是完成状态");
+      return;
     }
+    // 打勾已经生效（写进任务笔记了）；写入完成账本要先过确认清单
+    // 这里不查滴答，避免每次勾选都发一次网络请求
+    try {
+      const pending = await this.collectPendingCandidates({ includeDida: false });
+      if (pending.length === 0) {
+        new Notice("行动项已完成");
+        return;
+      }
+      await this.reviewAndCommitCandidates(pending);
+    } catch (error) {
+      console.error("同步完成记录失败", error);
+      new Notice("行动项已完成，但读取待同步清单失败，请点「任务更新」重试");
+    }
+  }
+
+  // 弹出确认清单 → 用户勾选 → 写入。无候选时只提示，不弹空窗
+  async reviewAndCommitCandidates(pending: LedgerCandidate[], afterCommit?: () => void | Promise<void>) {
+    if (pending.length === 0) {
+      new Notice("已是最新，无待同步的完成记录");
+      await afterCommit?.();
+      return;
+    }
+    new SyncPreviewModal(
+      this.app,
+      pending,
+      async (chosen) => {
+        if (chosen.length === 0) {
+          new Notice("已取消，未写入任何记录");
+          await afterCommit?.();
+          return;
+        }
+        try {
+          const { today, backfill } = await this.commitCandidates(chosen);
+          const parts: string[] = [];
+          if (today > 0) parts.push(`今日 ${today} 条`);
+          if (backfill > 0) parts.push(`补录历史 ${backfill} 条`);
+          new Notice(parts.length > 0 ? `已写入完成账本：${parts.join("、")}` : "没有新增记录");
+        } catch (error) {
+          console.error("写入完成账本失败", error);
+          new Notice(`写入失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+        await afterCommit?.();
+      },
+      (path) => this.openPathInSide(path)
+    ).open();
   }
 
   async openPathInSide(path: string) {
@@ -3659,44 +4104,85 @@ export default class ActWorkspacePlugin extends Plugin {
     const mode = this.settings.terminalMode;
 
     if (mode === "terminal") {
-      const opened = await this.openInTerminalPlugin(command);
-      if (opened) { new Notice(successMessage); return; }
+      const result = await this.openInTerminalPlugin(command);
+      if (result.ok) { new Notice(successMessage); return; }
+      // 不再静默降级：说清卡在哪一环，否则用户只看到「已复制」，无从判断为什么没执行
+      await this.copyText(command, `${describeTerminalPluginFailure(result.reason)}\n已复制命令到剪贴板，可手动粘贴执行。`);
+      return;
     }
-
 
     if (mode === "system") {
       const opened = await this.openExternalTerminal(command);
       if (opened) { new Notice(successMessage); return; }
+      await this.copyText(command, "无法启动系统终端。已复制命令到剪贴板，可手动粘贴执行。");
+      return;
     }
 
     await this.copyText(command, fallbackMessage);
   }
 
-  private async openInTerminalPlugin(command: string): Promise<boolean> {
+  // Terminal 插件的终端不是同步就绪的：Windows 上要写临时 .bat、经 cmd 启动、再 spawn Python resizer，
+  // 比 macOS 直接 spawn zsh 慢得多。旧实现固定等 500ms 就去取 emulator，Windows 上基本等不到，
+  // 于是静默降级到剪贴板 —— 表现就是「终端开了，但命令没进去」。
+  // 这里改成轮询等待就绪，并且只认本次新开的那个终端，失败时返回具体原因供调用方提示。
+  private async openInTerminalPlugin(command: string): Promise<TerminalPluginResult> {
     const commands = (this.app as App & { commands?: { executeCommandById?: (id: string) => boolean | void } }).commands;
-    if (!commands?.executeCommandById) return false;
+    if (!commands?.executeCommandById) return { ok: false, reason: "no-command-api" };
+
+    // 返回可直接调用的 paste，避免可选属性在调用点反复收窄
+    const readyPaste = (leaf: WorkspaceLeaf | undefined): ((text: string) => void) | null => {
+      const termView = leaf?.view as unknown as { emulator?: { terminal?: { paste?: (text: string) => void } } } | undefined;
+      const terminal = termView?.emulator?.terminal;
+      if (!terminal || typeof terminal.paste !== "function") return null;
+      return (text: string) => terminal.paste?.(text);
+    };
+
+    // 先记录已存在的终端，之后只认新出现的那个；否则命令可能被粘到之前留下的旧终端里
+    const before = new Set(this.app.workspace.getLeavesOfType(TERMINAL_VIEW_TYPE));
     commands.executeCommandById("terminal:open-terminal.integrated.root");
-    await new Promise((r) => setTimeout(r, 500));
-    const leaves = this.app.workspace.getLeavesOfType("terminal:terminal");
-    const leaf = leaves[leaves.length - 1];
-    if (!leaf) return false;
-    const termView = leaf.view as unknown as { emulator?: { terminal?: { paste?: (text: string) => void } } };
-    const terminal = termView.emulator?.terminal;
-    if (!terminal?.paste) return false;
-    terminal.paste(command + "\n");
-    return true;
+
+    const deadline = Date.now() + TERMINAL_READY_TIMEOUT_MS;
+    let sawNewLeaf = false;
+    while (Date.now() < deadline) {
+      const leaves = this.app.workspace.getLeavesOfType(TERMINAL_VIEW_TYPE);
+      const fresh = leaves.filter((leaf) => !before.has(leaf));
+      if (fresh.length > 0) sawNewLeaf = true;
+
+      const paste = readyPaste(fresh[fresh.length - 1]);
+      if (paste) {
+        paste(command + "\n");
+        return { ok: true };
+      }
+
+      // 兜底：某些配置下命令会复用已有终端而不新开一个。等过宽限期仍没有新终端时，退回用最新的已就绪终端，
+      // 保持旧版行为不被破坏（macOS 上原本就是这么走的）
+      if (!sawNewLeaf && Date.now() > deadline - TERMINAL_READY_TIMEOUT_MS + TERMINAL_NEW_LEAF_GRACE_MS) {
+        const reused = readyPaste(leaves[leaves.length - 1]);
+        if (reused) {
+          reused(command + "\n");
+          return { ok: true };
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, TERMINAL_POLL_INTERVAL_MS));
+    }
+
+    return { ok: false, reason: sawNewLeaf ? "emulator-timeout" : "terminal-not-opened" };
   }
 
   private buildSkillCommand(skillName: string): string {
     const vaultPath = this.getVaultBasePath() ?? ".";
     const template = this.settings.skillCommandTemplate || DEFAULT_SETTINGS.skillCommandTemplate;
-    const cli = template.includes("claude '") ? "claude" : "codex";
+    const cli = detectSkillCli(template).bin;
 
+    // 技能名按约定带前导 `-`（如 -笔记-笔记分诊），直接当位置参数会被解析成选项：
+    //   codex '-笔记-笔记分诊'  →  error: unexpected argument '-笔' found
+    // 用 `--` 隔断，后面的内容一律按字面值传递。技能名本身不做改写 —— codex 是按文件夹名匹配技能的
     if (getRuntimePlatform() === "win32") {
-      return `cd /d ${windowsCmdQuote(vaultPath)} && ${cli} ${windowsCmdQuote(skillName)}`;
+      return `cd /d ${windowsCmdQuote(vaultPath)} && ${cli} -- ${windowsCmdQuote(skillName)}`;
     }
 
-    return `cd ${shellQuote(vaultPath)} && ${cli} ${shellQuote(skillName)}`;
+    return `cd ${shellQuote(vaultPath)} && ${cli} -- ${shellQuote(skillName)}`;
   }
 
   async copyText(text: string, notice = "已复制") {
@@ -3738,13 +4224,51 @@ export default class ActWorkspacePlugin extends Plugin {
     }
 
     if (platform === "win32") {
-      const args = command.trim() ? ["cmd", "/k", command] : ["cmd"];
+      if (!command.trim()) {
+        return new Promise((resolve) => {
+          childProcess.execFile("cmd", ["/c", "start", "", "cmd"], (error) => resolve(!error));
+        });
+      }
+      // 不再把整条命令拼进 `cmd /c start cmd /k "..."`：内层已有引号，Node 再包一层就成了嵌套引号，
+      // 而 cmd 没有引号转义概念，路径含空格或中文时必然解析失败。
+      // 改为落一个临时 .cmd 脚本再执行，引号只在脚本内部出现一次，同时能设 UTF-8 代码页并自检 CLI 是否在 PATH。
+      const scriptPath = this.writeWindowsLauncherScript(command);
+      if (!scriptPath) return false;
       return new Promise((resolve) => {
-        childProcess.execFile("cmd", ["/c", "start", ...args], (error) => resolve(!error));
+        childProcess.execFile("cmd", ["/c", "start", "", "cmd", "/k", scriptPath], (error) => resolve(!error));
       });
     }
 
     return false;
+  }
+
+  // 生成 %TEMP%\act-skill-<时间戳>.cmd。chcp 65001 解决中文乱码；where 自检把
+  // 「CLI 不在 PATH」从黑窗一闪变成一句看得懂的提示
+  private writeWindowsLauncherScript(command: string): string | null {
+    const req = getNodeRequire();
+    if (!req) return null;
+    try {
+      const fs = req("fs") as { writeFileSync: (p: string, d: string, o?: unknown) => void };
+      const os = req("os") as { tmpdir: () => string };
+      const path = req("path") as { join: (...parts: string[]) => string };
+      const scriptPath = path.join(os.tmpdir(), `act-skill-${Date.now()}.cmd`);
+      // 只取 && 之后的第一个「非选项」词作为 CLI 名（命令里现在含 `--` 隔断符，不能误抓成命令名）
+      const cliName = command.match(/&&\s*([A-Za-z][A-Za-z0-9_.-]*)/)?.[1] ?? "";
+      const lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        cliName
+          ? `where ${cliName} >nul 2>nul || (echo [ACT] 未找到命令 ${cliName}，请确认已安装且在 PATH 中。 & echo. & pause & exit /b 1)`
+          : "",
+        command,
+        ""
+      ].filter((line) => line !== "");
+      fs.writeFileSync(scriptPath, `${lines.join("\r\n")}\r\n`, { encoding: "utf8" });
+      return scriptPath;
+    } catch (error) {
+      console.error("[ACT] 生成 Windows 启动脚本失败", error);
+      return null;
+    }
   }
 
   private updateCheckTimes: number[] = [];
@@ -4016,7 +4540,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
     const list = card.createDiv({ cls: "act-support-list" });
     list.createEl("p", { text: "往期个人生产力视频合集" });
     list.createEl("p", { text: "Obsidian 官方同步拼车：已拼 4000+" });
-    list.createEl("p", { text: "Obsidian + AI 笔记系统教程：学员 200+" });
+    list.createEl("p", { text: "Obsidian + AI 笔记系统教程：学员 500+" });
 
     const blogLine = card.createEl("p", { cls: "act-support-blog" });
     blogLine.appendText("详情介绍与购买，请查看个人博客：");
@@ -4025,6 +4549,91 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
       event.preventDefault();
       window.open("https://kivenbig.com", "_blank");
     });
+  }
+
+  // 说明文案里的 CLI 名称跟随「CLI 工具」下拉框，避免出现「claude 或 codex」这种要用户自己二选一的写法
+  // 判定条件必须与 buildSkillCommand / CLI 下拉框保持一致（都用 "claude '"），
+  // 否则说明写着 Claude Code、实际执行的却是 codex
+  private currentCli(): { bin: string; label: string } {
+    return detectSkillCli(this.plugin.settings.skillCommandTemplate);
+  }
+
+  // 只渲染当前平台的说明。分「必做 / 点了会怎样 / 出问题时」三段：
+  // 前置条件提到最前，推荐项唯一，备选项降级到排障段落
+  private renderSkillUsageGuide(container: HTMLElement) {
+    const { bin, label } = this.currentCli();
+    const platform = getRuntimePlatform();
+    const isWin = platform === "win32";
+    const isMac = platform === "darwin";
+    const envName = isMobileRuntime() ? "手机端" : isWin ? "Windows" : isMac ? "macOS" : "Linux";
+
+    const guide = container.createDiv({ cls: "act-settings-guide act-skill-usage-guide" });
+    const head = guide.createDiv({ cls: "act-skill-guide-head" });
+    head.createEl("h4", { text: "Skill 使用说明" });
+    head.createSpan({ text: `当前环境：${envName}`, cls: "act-skill-guide-env" });
+
+    const section = (title: string) => {
+      const box = guide.createDiv({ cls: "act-skill-usage-platform" });
+      box.createEl("strong", { text: title });
+      return box.createEl("ul");
+    };
+
+    if (isMobileRuntime()) {
+      const steps = section("手机端");
+      steps.createEl("li", { text: `手机端无法启动终端，${label} 也不能在手机上运行。` });
+      steps.createEl("li", { text: "点 Skill 按钮只会把命令复制到剪贴板，需要回到电脑上执行。" });
+      return;
+    }
+
+    // ===== 必做 =====
+    const must = section("必做");
+    must.createEl("li", {
+      text: isWin
+        ? `确认已安装 ${label}：在命令提示符或 PowerShell 运行 ${bin} --version`
+        : `确认已安装 ${label}：在终端运行 ${bin} --version`
+    });
+    must.createEl("li", {
+      text: isWin
+        ? "终端模式选「系统终端」——Windows 上唯一不需要额外依赖的方式。"
+        : "终端模式选「系统终端」（直接打开 macOS Terminal）或「Terminal 插件」（在 Obsidian 内嵌终端里运行），两者都可用。"
+    });
+
+    // ===== 点了会怎样 =====
+    const expect = section("点了会怎样");
+    expect.createEl("li", { text: `终端打开 → 自动进入 Vault 目录 → 启动 ${label} → 技能名已填好。` });
+    expect.createEl("li", { text: "如果终端没打开、或打开后是空的，说明没成功，看下面一段。" });
+
+    // ===== 出问题时 =====
+    const trouble = section("出问题时");
+    if (isWin) {
+      trouble.createEl("li", { text: "提示「终端缩放器意外退出：9009」→ 这是 Terminal 插件缺 Python。把终端模式改为「系统终端」即可绕开（该插件设置里没有 Python 字段，只能改原始 JSON，不推荐折腾）。" });
+      trouble.createEl("li", { text: `终端闪一下就关、或提示「不是内部或外部命令」→ ${bin} 不在 PATH 上。先在命令提示符确认 ${bin} --version 能跑。` });
+    } else {
+      trouble.createEl("li", { text: "提示「终端已打开但未能就绪」→ Terminal 插件的内嵌终端没起来，改用「系统终端」重试。" });
+      trouble.createEl("li", { text: `终端提示 command not found: ${bin} → 该命令不在 PATH 上。若你是用 shell 函数或别名包装的，请改用「仅复制命令」手动粘贴。` });
+    }
+    trouble.createEl("li", { text: "想用自己的终端或远程环境 → 选「仅复制命令」，点 Skill 后手动粘贴执行。" });
+  }
+
+
+
+
+
+  // 折叠区：路径、模板这类「装好就不用动」的设置默认收起，避免新手一打开就面对几十个输入框。
+  // 用原生 <details>，无需额外 JS；展开状态记在实例上，重渲染后不丢
+  private openFolds = new Set<string>();
+
+  private collapsible(container: HTMLElement, title: string, hint: string): HTMLElement {
+    const details = container.createEl("details", { cls: "act-fold" });
+    if (this.openFolds.has(title)) details.setAttribute("open", "");
+    details.addEventListener("toggle", () => {
+      if (details.hasAttribute("open")) this.openFolds.add(title);
+      else this.openFolds.delete(title);
+    });
+    const summary = details.createEl("summary", { cls: "act-fold-summary" });
+    summary.createSpan({ text: title, cls: "act-fold-title" });
+    summary.createSpan({ text: hint, cls: "act-fold-hint" });
+    return details.createDiv({ cls: "act-fold-body" });
   }
 
   private getVaultFolders(): TFolder[] {
@@ -4104,10 +4713,39 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
   }
 
   private renderActionTab(container: HTMLElement) {
-    container.createEl("h3", { text: "工作台交互" });
+    // ===== 通用（与 Action 层无关的全局项，集中放在最前面）=====
+    container.createEl("h3", { text: "通用" });
+    container.createDiv({
+      text: `当前运行环境：${isMobileRuntime() ? "手机端" : "电脑端"}。启动开关两端独立设置，互不影响。`,
+      cls: "setting-item-description"
+    });
+
+
+    new Setting(container)
+      .setName("手机端启动时打开")
+      .setDesc("在手机端打开 Obsidian 后，自动进入 ACT 工作台。")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.openOnMobileStartup);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.openOnMobileStartup = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(container)
+      .setName("电脑端启动时打开")
+      .setDesc("在电脑端打开 Obsidian 后，自动进入 ACT 工作台。关闭后可用左侧栏图标或命令面板「打开 ACT 工作台」手动进入。")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.openOnDesktopStartup);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.openOnDesktopStartup = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
     new Setting(container)
       .setName("笔记打开方式")
-      .setDesc("选择从 ACT 工作台打开已有笔记或新建笔记时使用右侧分栏，还是新标签页。")
+      .setDesc("在工作台里点开一篇笔记时，是在右边分栏打开（工作台仍可见），还是新开一个标签页。")
       .addDropdown((dropdown) => {
         dropdown.addOption("split", "右侧分栏");
         dropdown.addOption("tab", "新标签页");
@@ -4118,24 +4756,10 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         });
       });
 
-    container.createDiv({
-      text: "行动层对应的 Vault 文件夹路径。修改后需重新打开工作台生效。",
-      cls: "setting-item-description"
-    });
-
-    this.folderSetting(container, "inbox", "收件箱", "快速捕获入口");
-    this.folderSetting(container, "focusAction", "聚焦承诺", "核心任务文件夹");
-    this.folderSetting(container, "activeAction", "活跃跟进", "跟进任务文件夹");
-    this.folderSetting(container, "maybeAction", "将来也许", "暂缓任务文件夹");
-    this.folderSetting(container, "thought", "闪念", "ACT 闪念文件夹");
-
-    container.createEl("h3", { text: "笔记模板" });
-    this.templateSetting(container, "taskNote", "任务笔记模板", "新建任务笔记时使用的模板文件，留空使用内置模板。");
-
     container.createEl("h3", { text: "任务清单" });
     new Setting(container)
       .setName("隐藏已完成的任务笔记")
-      .setDesc("开启后，所有行动项均已完成的任务笔记不会出现在「任务清单 · 今日」中。关闭则始终显示。")
+      .setDesc("一篇任务笔记里的事全都做完后，就不再显示在「任务清单 · 今日」里，让列表更干净。关闭则一直显示。")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.hideCompletedNotes);
         toggle.onChange(async (value) => {
@@ -4144,10 +4768,114 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         });
       });
 
-    container.createEl("h3", { text: "进展记录" });
-    new Setting(container)
-      .setName("写入标题")
-      .setDesc("保存进展时写入到哪个标题下面。支持 # / ## / ###，例如：## 进展记录。")
+    // ===== 以下默认折叠，顺序：路径 → 完成记录 → 高级 =====
+    const paths = this.collapsible(container, "文件夹与模板路径", "已预置，通常无需修改");
+    paths.createDiv({
+      text: "模板里已经配好了。只有你自己改过文件夹名字，才需要在这里跟着改。改完要重新打开工作台才生效。",
+      cls: "setting-item-description"
+    });
+    this.folderSetting(paths, "inbox", "收件箱", "想法先扔这里，之后再整理");
+    this.folderSetting(paths, "focusAction", "聚焦承诺", "当前最重要、要持续推进的事");
+    this.folderSetting(paths, "activeAction", "活跃跟进", "在做，但没那么紧急的事");
+    this.folderSetting(paths, "maybeAction", "将来也许", "以后可能做，现在先不推进");
+    this.folderSetting(paths, "thought", "闪念", "随手记下的一句话想法");
+    this.templateSetting(paths, "taskNote", "任务笔记模板", "新建任务笔记时套用的样式。留空就用插件自带的，一样能用。");
+
+    const done = this.collapsible(container, "完成记录", "完成的事记到哪篇笔记");
+    done.createDiv({
+      text: "你完成一件事，可能是在滴答清单里打勾、在工作台点复选框、或在日志里打勾。这三种都会被收拢写进同一篇笔记（默认是本周周记），工作台的「今日已完成」就是读那篇笔记。",
+      cls: "setting-item-description"
+    });
+
+    new Setting(done)
+      .setName("在任务笔记里打勾时，自动补上完成日期")
+      .setDesc("Obsidian 自带的复选框打勾后只会变成 [x]，不记日期，插件就不知道它是哪天完成的，这条也就收不进来。开启后会自动补一个 ✅ 日期。只处理你新打的勾，以前就已经勾上的不会被改动。装了 Tasks 插件的话由它来写，不会重复。")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.autoStampDoneDate);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.autoStampDoneDate = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(done)
+      .setName("完成记录写到哪篇笔记")
+      .setDesc("默认写进当周周记，做周回顾时正好能看到。也可以改成写进当天日志，或自己指定一篇。")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("weekly", "本周周记（推荐）");
+        dropdown.addOption("daily", "当天日志");
+        dropdown.addOption("custom", "自己指定一篇");
+        dropdown.setValue(this.plugin.settings.completedLog.target);
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.completedLog.target = value as CompletedLogTarget;
+          if (value === "weekly") this.plugin.settings.completedLog.pathTemplate = "{weeklyFolder}/{weekId}.md";
+          if (value === "daily") this.plugin.settings.completedLog.pathTemplate = "{dailyFolder}/{dailyDate}.md";
+          await this.plugin.saveSettings();
+          this.renderTabContent(container);
+        });
+      });
+
+    const targetHelp = done.createDiv({ cls: "setting-item-description" });
+    if (this.plugin.settings.completedLog.target === "weekly") {
+      targetHelp.setText("现在的规则：按完成日期写进对应那一周的周记，例如 2026-W25.md。日志里打的勾也会汇总过去。");
+    } else if (this.plugin.settings.completedLog.target === "daily") {
+      targetHelp.setText("现在的规则：按完成日期写进当天日志，例如 2026-06-15（周一）.md。注意：这样周记里就没有完成记录了，做周回顾时需要自己汇总。");
+    } else {
+      targetHelp.setText("现在的规则：全部写进你在下面填的那篇笔记。适合单独维护一份完成清单。");
+      new Setting(done)
+        .setName("指定笔记的路径")
+        .setDesc("可以用这些占位符自动带上日期：{weekId} 周记编号、{date} 完成日期、{dailyDate} 日志文件名、{year}/{month}/{day} 年月日。例：40-storage/完成记录-{year}-{month}.md")
+        .addText((text) => {
+          text.setPlaceholder("{weeklyFolder}/{weekId}.md");
+          text.setValue(this.plugin.settings.completedLog.pathTemplate);
+          text.inputEl.style.width = "100%";
+          text.onChange(async (value) => {
+            this.plugin.settings.completedLog.pathTemplate = value.trim() || DEFAULT_COMPLETED_LOG.pathTemplate;
+            await this.plugin.saveSettings();
+          });
+        });
+    }
+
+    new Setting(done)
+      .setName("写在笔记的哪个标题下面")
+      .setDesc("填一个标题，完成记录就写在它下面，并按日期自动分小节。不确定就保持默认的「## 每日记录」。进阶：填 ### {dateHeading} 可以直接写到当天的日期标题下。")
+      .addText((text) => {
+        text.setPlaceholder(DEFAULT_COMPLETED_LOG.heading);
+        text.setValue(this.plugin.settings.completedLog.heading);
+        text.inputEl.style.width = "100%";
+        text.onChange(async (value) => {
+          this.plugin.settings.completedLog.heading = value.trim() || DEFAULT_COMPLETED_LOG.heading;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    if (this.plugin.settings.completedLog.target !== "daily") {
+      new Setting(done)
+        .setName("往前检查几天的日志")
+        .setDesc("点工作台的「任务更新」时，会往前翻这么多天的日志，把里面打了勾、但还没收进来的条目补上。填 0 就只看今天。")
+        .addText((text) => {
+          text.setPlaceholder(String(DEFAULT_COMPLETED_LOG.dailyLookbackDays));
+          text.setValue(String(this.plugin.settings.completedLog.dailyLookbackDays));
+          text.inputEl.type = "number";
+          text.inputEl.min = "0";
+          text.inputEl.max = "90";
+          text.inputEl.style.width = "80px";
+          text.onChange(async (value) => {
+            this.plugin.settings.completedLog.dailyLookbackDays = Math.max(0, Math.min(90, parseInt(value) || 0));
+            await this.plugin.saveSettings();
+          });
+        });
+    }
+
+    const advanced = this.collapsible(container, "高级", "进展记录格式、刷新间隔");
+    advanced.createEl("h3", { text: "进展记录" });
+    advanced.createDiv({
+      text: "在工作台给某个任务写一句进展时，这段话写到任务笔记的哪里、长什么样。",
+      cls: "setting-item-description"
+    });
+    new Setting(advanced)
+      .setName("进展写在哪个标题下面")
+      .setDesc("填一个标题，例如 ## 进展记录。支持 # / ## / ###。")
       .addText((text) => {
         text.setPlaceholder(DEFAULT_PROGRESS_LOG.heading);
         text.setValue(this.plugin.settings.progressLog.heading);
@@ -4158,9 +4886,9 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(container)
-      .setName("写入格式")
-      .setDesc("三级标题 + 时间：### 2026-06-15 16:21；项目符 + 时间：- 2026-06-15 16:21 内容。")
+    new Setting(advanced)
+      .setName("每条进展长什么样")
+      .setDesc("三级标题 + 时间 → 独立成段，适合写长一点；项目符 + 时间 → 一行一条，适合简短记录。")
       .addDropdown((dropdown) => {
         dropdown.addOption("heading-time", "三级标题 + 时间");
         dropdown.addOption("bullet-time", "项目符 + 时间");
@@ -4171,10 +4899,10 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         });
       });
 
-    container.createEl("h3", { text: "数据刷新" });
-    new Setting(container)
-      .setName("自动刷新间隔（秒）")
-      .setDesc("工作台面板多久自动刷新一次数据。设为 0 则关闭自动刷新，仅在打开时加载。")
+    advanced.createEl("h3", { text: "数据刷新" });
+    new Setting(advanced)
+      .setName("工作台自动刷新间隔（秒）")
+      .setDesc("工作台每隔多久重新读一次笔记。默认 30 秒，一般不用改。填 0 就只在打开时读一次。")
       .addText((text) => {
         text.setPlaceholder("30");
         text.setValue(String(this.plugin.settings.refreshInterval));
@@ -4197,7 +4925,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
   private renderTimeTab(container: HTMLElement) {
     new Setting(container)
       .setName("周期划分方式")
-      .setDesc("按季度月份（1-3/4-6/7-9/10-12月）或严格每 12 周划分")
+      .setDesc("一个「周期」怎么算。按季度月份最省心（1-3月、4-6月…），和自然季度对齐；严格 12 周则从起始日开始每 12 周一轮。不确定就用推荐的。")
       .addDropdown((dropdown) => {
         dropdown.addOption("monthly", "按季度月份（推荐）");
         dropdown.addOption("weekly", "严格 12 周");
@@ -4212,29 +4940,40 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
       });
 
     container.createEl("h3", { text: "文件夹路径" });
-
-    this.folderSetting(container, "daily", "日志", "每日日志文件夹");
-    this.folderSetting(container, "weekly", "周记", "每周周记文件夹");
-    this.folderSetting(container, "cycle", "周期目标", "12 周/季度目标文件夹");
-    this.folderSetting(container, "vision", "愿景", "长期愿景文件夹");
+    container.createDiv({
+      text: "模板里已经配好了。只有你自己改过文件夹名字，才需要在这里跟着改。改完要重新打开工作台才生效。",
+      cls: "setting-item-description"
+    });
+    this.folderSetting(container, "daily", "日志", "每天一篇，记今天做了什么");
+    this.folderSetting(container, "weekly", "周记", "每周一篇，本周计划与回顾");
+    this.folderSetting(container, "cycle", "周期目标", "12 周（或一个季度）的目标");
+    this.folderSetting(container, "vision", "愿景", "更长期的方向，很少改动");
 
     container.createEl("h3", { text: "笔记模板" });
-    this.templateSetting(container, "cycle", "十二周目标模板", "点击“打开目标笔记”新建周期目标时使用；留空使用内置模板。支持 {{year}}、{{cycle}}、{{cycleId}}、{{totalWeeks}} 变量。");
-    this.templateSetting(container, "weekly", "周记模板", "新建周记时使用的模板文件，留空使用内置模板。");
-    this.templateSetting(container, "daily", "日志模板", "新建日志时使用的模板文件，留空使用内置模板。");
+    container.createDiv({
+      text: "新建笔记时套用的样式。留空就用插件自带的，一样能用。",
+      cls: "setting-item-description"
+    });
+    this.templateSetting(container, "cycle", "周期目标模板", "点「打开目标笔记」新建时套用。进阶：模板里写 {{year}}、{{cycle}}、{{cycleId}}、{{totalWeeks}} 会自动替换成当前年份和周期。");
+    this.templateSetting(container, "weekly", "周记模板", "新建周记时套用。");
+    this.templateSetting(container, "daily", "日志模板", "新建日志时套用。");
   }
 
   private renderCardTab(container: HTMLElement) {
     container.createDiv({
-      text: "知识层卡片来源配置。每种卡片可选择按文件夹或按标签搜索，修改后需重新打开工作台生效。",
+      text: "工作台的「知识」区会统计每类卡片有多少张。这里决定显示哪几类、以及从哪里统计。改完要重新打开工作台才生效。",
+      cls: "setting-item-description"
+    });
+    container.createDiv({
+      text: "每行左边的开关 = 要不要在工作台显示这一类；右边的下拉 = 按文件夹统计，还是按标签统计。",
       cls: "setting-item-description"
     });
 
     const cardTypes: { key: string; folderKey: keyof FolderPaths; label: string; desc: string }[] = [
-      { key: "mainCard", folderKey: "mainCard", label: "核心卡", desc: "核心知识卡片" },
-      { key: "bibCard", folderKey: "bibCard", label: "阅读卡", desc: "阅读笔记卡片" },
-      { key: "indexCard", folderKey: "indexCard", label: "索引卡", desc: "主题索引卡片" },
-      { key: "newCard", folderKey: "newCard", label: "新卡暂存", desc: "待编号新卡" }
+      { key: "mainCard", folderKey: "mainCard", label: "核心卡", desc: "用自己的话写下来的想法，一张一个观点" },
+      { key: "bibCard", folderKey: "bibCard", label: "阅读卡", desc: "读书、看视频时摘录和整理的内容" },
+      { key: "indexCard", folderKey: "indexCard", label: "索引卡", desc: "把同一主题的卡片串起来的目录页" },
+      { key: "newCard", folderKey: "newCard", label: "新卡暂存", desc: "还没归类、没编号的新卡。默认不显示" }
     ];
     for (const ct of cardTypes) {
       const vis = this.plugin.settings.cardVisibility ?? {};
@@ -4265,7 +5004,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
 
       if (mode === "folder") {
         new Setting(container)
-          .setDesc("文件夹路径")
+          .setDesc("统计这个文件夹里的笔记")
           .addSearch((search) => {
             const folders = this.getVaultFolders();
             const listId = `act-card-folder-${ct.key}`;
@@ -4293,7 +5032,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
           });
       } else {
         new Setting(container)
-          .setDesc("标签名称（不含 #）")
+          .setDesc("统计带这个标签的笔记。只填标签名，不要写 #")
           .addText((text) => {
             text
               .setPlaceholder("例如：c-核心卡")
@@ -4306,9 +5045,13 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
       }
     }
 
-    container.createEl("h3", { text: "数据视图跳转" });
+    container.createEl("h3", { text: "点数字后跳到哪" });
     container.createDiv({
-      text: "点击知识层统计卡片时打开的 .base 数据视图路径。支持 文件名#视图名 格式。留空则不可点击。",
+      text: "工作台「知识」区的数字是可以点的，点了会打开一个表格视图（.base 文件）。这里指定各自打开哪一个。留空的话那个数字就点不动。",
+      cls: "setting-item-description"
+    });
+    container.createDiv({
+      text: "写成 文件名#视图名 可以直接跳到该文件里的指定视图，例如 20-Card/知识总览.base#核心卡总览。",
       cls: "setting-item-description"
     });
 
@@ -4356,7 +5099,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
   private renderDidaTab(container: HTMLElement) {
     new Setting(container)
       .setName("启用滴答清单")
-      .setDesc("开启后可在今日聚焦中查看和管理滴答清单任务，并自动同步已完成任务到周记")
+      .setDesc("不用滴答清单就保持关闭，工作台不受影响。开启后「今日聚焦」里会多出一块滴答任务，可以直接勾选、新增，完成的任务也会一起收进完成记录。")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.dida.enabled);
         toggle.onChange(async (value) => {
@@ -4369,7 +5112,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
 
     new Setting(container)
       .setName("Access Token")
-      .setDesc("滴答清单开放 API 的 Access Token")
+      .setDesc("一串授权口令，让插件能读写你的滴答清单。按下面四步去滴答清单网页版申请。只保存在本机，不会上传。")
       .addText((text) => {
         text.setPlaceholder("your-access-token");
         text.setValue(this.plugin.settings.dida.accessToken);
@@ -4381,59 +5124,13 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(container)
-      .setName("完成记录保存位置")
-      .setDesc("选择完成任务后写入哪类笔记。默认保存到对应周记；如果想完全自定义路径，再选择「自定义笔记」。")
-      .addDropdown((dropdown) => {
-        dropdown.addOption("weekly", "每周周记");
-        dropdown.addOption("daily", "每日日志");
-        dropdown.addOption("custom", "自定义笔记");
-        dropdown.setValue(this.plugin.settings.dida.completedLogTarget);
-        dropdown.onChange(async (value) => {
-          this.plugin.settings.dida.completedLogTarget = value as CompletedLogTarget;
-          if (value === "weekly") this.plugin.settings.dida.completedLogPathTemplate = "{weeklyFolder}/{weekId}.md";
-          if (value === "daily") this.plugin.settings.dida.completedLogPathTemplate = "{dailyFolder}/{dailyDate}.md";
-          await this.plugin.saveSettings();
-          this.renderTabContent(container);
-        });
-      });
-
-    const targetHelp = container.createDiv({ cls: "setting-item-description" });
-    if (this.plugin.settings.dida.completedLogTarget === "weekly") {
-      targetHelp.setText("当前规则：按完成日期写入对应周记，例如 2026-W25.md。");
-    } else if (this.plugin.settings.dida.completedLogTarget === "daily") {
-      targetHelp.setText("当前规则：按完成日期写入对应日志，例如 2026-06-15（周一）.md。");
-    } else {
-      targetHelp.setText("当前规则：按下方自定义路径写入。适合你想单独维护一个完成记录汇总笔记。");
-      new Setting(container)
-        .setName("自定义目标笔记")
-        .setDesc("高级选项。可用占位符：{weekId}=周记编号，{date}=完成日期，{dailyDate}=日志文件名，{year}/{month}/{day}=年月日。")
-        .addText((text) => {
-          text.setPlaceholder("{weeklyFolder}/{weekId}.md");
-          text.setValue(this.plugin.settings.dida.completedLogPathTemplate);
-          text.inputEl.style.width = "100%";
-          text.onChange(async (value) => {
-            this.plugin.settings.dida.completedLogPathTemplate = value.trim() || DEFAULT_DIDA.completedLogPathTemplate;
-            await this.plugin.saveSettings();
-          });
-        });
-    }
-
-    new Setting(container)
-      .setName("完成记录保存标题")
-      .setDesc("输入 # / ## / ### 加标题，插件会按该级标题写入。示例：## 每日记录；若输入一级或二级标题，会在其下按日期自动建立下一层小节。也可用 ### {dateHeading} 直接写到当天标题下。")
-      .addText((text) => {
-        text.setPlaceholder("## 每日记录");
-        text.setValue(this.plugin.settings.dida.completedLogHeading);
-        text.inputEl.style.width = "100%";
-        text.onChange(async (value) => {
-          this.plugin.settings.dida.completedLogHeading = value.trim() || DEFAULT_DIDA.completedLogHeading;
-          await this.plugin.saveSettings();
-        });
-      });
+    container.createDiv({
+      text: "完成记录的保存位置与写入标题已移到「行动」页签 → 完成记录，三条来源（滴答清单、行动勾选、日志勾选）统一在那里配置。",
+      cls: "setting-item-description"
+    });
 
     const guideEl = container.createDiv({ cls: "act-settings-guide" });
-    guideEl.createEl("h4", { text: "如何获取 Access Token" });
+    guideEl.createEl("h4", { text: "去哪拿这串口令" });
     const steps = guideEl.createEl("ol");
     steps.createEl("li", { text: "前往网页版滴答清单（dida365.com）并登录" });
     steps.createEl("li", { text: "点击右上角「头像」→「设置」" });
@@ -4445,7 +5142,7 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
     new Setting(container)
       .setName("终端模式")
       .setDesc(getRuntimePlatform() === "win32"
-        ? "Windows 推荐使用系统终端。若使用 Terminal 插件，需在其设置中将 Python 可执行文件配置为 python.exe 或 py.exe，否则会提示 spawn python3 ENOENT。"
+        ? "Windows 请用「系统终端」。Terminal 插件在 Windows 需要 Python，缺失时会提示「终端缩放器意外退出：9009」且命令送不进终端。"
         : "点击 Skill 按钮时打开哪个终端")
       .addDropdown((dropdown) => {
         dropdown.addOption("terminal", "Terminal 插件");
@@ -4455,8 +5152,27 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         dropdown.onChange(async (value) => {
           this.plugin.settings.terminalMode = value as TerminalMode;
           await this.plugin.saveSettings();
+          this.renderTabContent(container); // 说明与警告随所选模式变化
         });
       });
+
+    // Windows + Terminal 插件 = 已知会失败的组合（缺 Python 时 resizer 以 9009 退出，命令送不进终端）。
+    // 只写在说明里用户不一定看，这里直接给一个可点的修复入口
+    if (getRuntimePlatform() === "win32" && this.plugin.settings.terminalMode === "terminal") {
+      const warn = container.createDiv({ cls: "act-skill-warning" });
+      warn.createDiv({ text: "⚠️ Windows 上不建议用 Terminal 插件", cls: "act-skill-warning-title" });
+      warn.createDiv({
+        text: "该插件在 Windows 需要 Python 才能启动终端，缺失时会提示「终端缩放器意外退出：9009」，Skill 命令送不进去。「系统终端」没有这个依赖。",
+        cls: "act-skill-warning-body"
+      });
+      const fixBtn = warn.createEl("button", { text: "改为「系统终端」", cls: "act-skill-warning-btn", attr: { type: "button" } });
+      fixBtn.addEventListener("click", async () => {
+        this.plugin.settings.terminalMode = "system";
+        await this.plugin.saveSettings();
+        new Notice("已切换为系统终端");
+        this.renderTabContent(container);
+      });
+    }
 
     new Setting(container)
       .setName("CLI 工具")
@@ -4465,38 +5181,19 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
         dropdown.addOption("claude", "Claude Code（claude）");
         dropdown.addOption("codex", "Codex（codex）");
         const current = this.plugin.settings.skillCommandTemplate;
-        if (current.includes("claude '")) dropdown.setValue("claude");
-        else dropdown.setValue("codex");
+        dropdown.setValue(detectSkillCli(current).bin);
         dropdown.onChange(async (value) => {
           if (value === "claude") {
-            this.plugin.settings.skillCommandTemplate = "cd {{vault}} && claude '{{skill}}'";
+            this.plugin.settings.skillCommandTemplate = "cd {{vault}} && claude -- '{{skill}}'";
           } else {
-            this.plugin.settings.skillCommandTemplate = "cd {{vault}} && codex '{{skill}}'";
+            this.plugin.settings.skillCommandTemplate = "cd {{vault}} && codex -- '{{skill}}'";
           }
           await this.plugin.saveSettings();
+          this.renderTabContent(container); // 说明里的 CLI 名称随之更新
         });
       });
 
-    const usageGuide = container.createDiv({ cls: "act-settings-guide act-skill-usage-guide" });
-    usageGuide.createEl("h4", { text: "Skill 使用说明" });
-
-    const macGuide = usageGuide.createDiv({ cls: "act-skill-usage-platform" });
-    macGuide.createEl("strong", { text: "macOS" });
-    const macSteps = macGuide.createEl("ul");
-    macSteps.createEl("li", { text: "推荐选择「Terminal 插件」或「系统终端」；系统终端会直接打开 macOS Terminal。" });
-    macSteps.createEl("li", { text: "请先在终端确认 claude --version 或 codex --version 能正常运行。" });
-
-    const windowsGuide = usageGuide.createDiv({ cls: "act-skill-usage-platform" });
-    windowsGuide.createEl("strong", { text: "Windows" });
-    const windowsSteps = windowsGuide.createEl("ul");
-    windowsSteps.createEl("li", { text: "推荐选择「系统终端」，插件会以 Windows 命令格式进入 Vault 后启动 Claude Code 或 Codex。" });
-    windowsSteps.createEl("li", { text: "若使用 Terminal 插件，请在该插件设置中把 Python 可执行文件设为 py.exe 或实际 python.exe 路径；出现 spawn python3 ENOENT 表示此项未配置。" });
-    windowsSteps.createEl("li", { text: "请先在 PowerShell 或命令提示符中确认 claude --version 或 codex --version 能正常运行。" });
-
-    const commonGuide = usageGuide.createDiv({ cls: "act-skill-usage-platform" });
-    commonGuide.createEl("strong", { text: "通用" });
-    const commonSteps = commonGuide.createEl("ul");
-    commonSteps.createEl("li", { text: "「仅复制命令」适合使用自己的终端插件或远程环境时手动粘贴运行。" });
+    this.renderSkillUsageGuide(container);
 
     const skillListEl = container.createDiv({ cls: "act-settings-skill-list" });
     this.renderSkillList(skillListEl);

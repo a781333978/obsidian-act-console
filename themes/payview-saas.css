@@ -3406,6 +3406,213 @@
   color: var(--text-muted);
   background: var(--background-modifier-border);
 }
+.act-completed-source.is-daily {
+  color: #fff;
+  background: #7d5ba6;
+}
+
+/* ===== 设置页：Windows 终端模式警告 ===== */
+.act-skill-warning {
+  margin: 10px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(192, 57, 43, 0.28);
+  border-left: 3px solid #c0392b;
+  border-radius: 10px;
+  background: rgba(192, 57, 43, 0.05);
+}
+.act-skill-warning-title {
+  color: #c0392b;
+  font-size: 13px;
+  font-weight: 700;
+}
+.act-skill-warning-body {
+  margin: 5px 0 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.act-skill-warning-btn {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  background: #c0392b;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.act-skill-warning-btn:hover { background: #a93226; }
+
+/* ===== 设置页：Skill 使用说明 ===== */
+.act-skill-guide-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.act-skill-guide-head h4 { margin: 0; }
+.act-skill-guide-env {
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: rgba(45, 106, 79, 0.1);
+  color: #2D6A4F;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ===== 设置页：折叠区 ===== */
+.act-fold {
+  margin: 14px 0 0;
+  border: 1px solid rgba(45, 106, 79, 0.16);
+  border-radius: 12px;
+  background: rgba(45, 106, 79, 0.025);
+  overflow: hidden;
+}
+.act-fold-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 11px 14px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.act-fold-summary::-webkit-details-marker { display: none; }
+.act-fold-summary::before {
+  content: "▸";
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  transition: transform 0.15s ease;
+}
+.act-fold[open] > .act-fold-summary::before { transform: rotate(90deg); }
+.act-fold-summary:hover { background: rgba(45, 106, 79, 0.05); }
+.act-fold-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.act-fold-hint {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.act-fold-body {
+  padding: 0 14px 8px;
+  border-top: 1px solid rgba(45, 106, 79, 0.1);
+}
+.act-fold-body h3:first-child { margin-top: 12px; }
+
+/* ===== 同步确认清单弹窗 ===== */
+.act-sync-modal {
+  width: min(620px, 92vw) !important;
+}
+.act-sync-toolbar {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+.act-sync-btn {
+  padding: 5px 12px;
+  border: 1px solid rgba(45, 106, 79, 0.2);
+  border-radius: 999px;
+  background: #FFFFFF;
+  color: #2D6A4F;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.act-sync-btn:hover {
+  border-color: rgba(45, 106, 79, 0.45);
+  background: rgba(45, 106, 79, 0.06);
+}
+.act-sync-list {
+  max-height: min(48vh, 420px);
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid rgba(45, 106, 79, 0.12);
+  border-radius: 12px;
+  background: #FBFDFC;
+}
+.act-sync-group + .act-sync-group {
+  margin-top: 10px;
+}
+.act-sync-group-title {
+  padding: 4px 8px;
+  color: #6F8179;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.act-sync-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 8px;
+}
+.act-sync-row:hover {
+  background: rgba(45, 106, 79, 0.05);
+}
+.act-sync-check {
+  flex-shrink: 0;
+  margin-top: 2px;
+  cursor: pointer;
+}
+.act-sync-row-main {
+  flex: 1;
+  min-width: 0;
+}
+.act-sync-row-text {
+  color: #1B4332;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.act-sync-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 3px;
+  font-size: 11px;
+}
+.act-sync-row-date {
+  color: #8FA39B;
+  font-variant-numeric: tabular-nums;
+}
+.act-sync-row-from {
+  color: #2D6A4F;
+  text-decoration: none;
+  border-bottom: 1px dashed rgba(45, 106, 79, 0.35);
+  overflow-wrap: anywhere;
+}
+.act-sync-row-from:hover {
+  border-bottom-style: solid;
+}
+.act-sync-row-from.is-external {
+  color: #8FA39B;
+  border-bottom: none;
+}
+.act-sync-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+.act-sync-confirm {
+  padding: 7px 18px;
+  border: none;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.act-sync-confirm:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 /* ===== Focus Tab: Recent Thoughts ===== */
 
