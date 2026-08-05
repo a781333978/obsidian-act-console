@@ -182,6 +182,7 @@ interface ActWorkspaceSettings {
   updateRepo: string;
   updateToken: string;
   hideCompletedNotes: boolean;
+  hideCompletedTaskItems: boolean;
   autoStampDoneDate: boolean;
   openOnMobileStartup: boolean;
   openOnDesktopStartup: boolean;
@@ -256,6 +257,7 @@ const DEFAULT_SETTINGS: ActWorkspaceSettings = {
   updateRepo: "",
   updateToken: "",
   hideCompletedNotes: false,
+  hideCompletedTaskItems: false,
   autoStampDoneDate: true,
   // 两端都默认开启，保持 0.3.5 及以前「启动即打开工作台」的既有行为
   openOnMobileStartup: true,
@@ -1521,7 +1523,7 @@ class ActWorkspaceView extends ItemView {
     popup.createDiv({ text: "数据来源", cls: "act-info-heading" });
     popup.createDiv({ text: current.folder, cls: "act-info-text" });
     popup.createDiv({ text: "显示规则", cls: "act-info-heading" });
-    popup.createDiv({ text: "仅显示带 #a-任务笔记 标签的笔记。行动项读取 ## 下步行动 区块中带 ! 或 ！ 标记的未完成内容；已完成行动项不在此处显示，会进入「今日已完成」。! / ！ = 一般，!! / ！！ = 重要，!!! / ！！！ = 最优先。", cls: "act-info-text" });
+    popup.createDiv({ text: "仅显示带 #a-任务笔记 标签的笔记。行动项读取 ## 下步行动 区块中带 ! 或 ！ 标记的内容；可在设置中隐藏已完成行动项，完成记录仍会进入「今日已完成」。! / ！ = 一般，!! / ！！ = 重要，!!! / ！！！ = 最优先。", cls: "act-info-text" });
     popup.createDiv({ text: "新建规则", cls: "act-info-heading" });
     popup.createDiv({ text: "点击 + 按钮新建任务笔记，自动保存到当前所选文件夹。笔记自带 #a-任务笔记 标签和标准模板（下步行动 / 进展记录 / 背景目标）。", cls: "act-info-text" });
 
@@ -1550,7 +1552,9 @@ class ActWorkspaceView extends ItemView {
       if (!tags.includes("a-任务笔记")) continue;
       const markedItems = parseMarkedActions(content);
       const pendingItems = markedItems.filter((item) => !item.done);
-      const todayDoneItems = markedItems.filter((item) => item.done && item.doneDate === todayStr);
+      const todayDoneItems = this.plugin.settings.hideCompletedTaskItems
+        ? []
+        : markedItems.filter((item) => item.done && item.doneDate === todayStr);
       const allDone = pendingItems.length === 0;
 
       if (this.plugin.settings.hideCompletedNotes && pendingItems.length === 0 && todayDoneItems.length === 0) continue;
@@ -2034,7 +2038,12 @@ class ActWorkspaceView extends ItemView {
     const nextActionLines = section
       ? contentLines.slice(section.start, section.end).map((line, offset) => ({ line, lineIndex: section.start + offset, writable: true }))
       : task.todos.map((todo) => ({ line: `- [ ] ${todo}`, lineIndex: -1, writable: false }));
-    const visibleNextActionLines = nextActionLines.filter((item) => item.line.trim());
+    const visibleNextActionLines = nextActionLines.filter((item) => {
+      const line = item.line.trim();
+      if (!line) return false;
+      if (!this.plugin.settings.hideCompletedTaskItems) return true;
+      return !/^[-*]\s*\[[xX]\]\s*/.test(line);
+    });
     if (visibleNextActionLines.length > 0) {
       const nextBox = container.createDiv({ cls: "act-workbench-next" });
       nextBox.createDiv({ text: "下步行动", cls: "act-workbench-next-title act-section-title" });
@@ -4758,7 +4767,20 @@ class ActWorkspaceSettingTab extends PluginSettingTab {
 
     container.createEl("h3", { text: "任务清单" });
     new Setting(container)
-      .setName("隐藏已完成的任务笔记")
+      .setName("隐藏已完成的行动项")
+      .setDesc("开启后，任务清单和任务详情的「下步行动」只显示未完成事项；完成内容仍保留在原笔记和「今日已完成」中。")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.hideCompletedTaskItems);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.hideCompletedTaskItems = value;
+          await this.plugin.saveSettings();
+          const view = this.plugin.app.workspace.getLeavesOfType(VIEW_TYPE)[0]?.view;
+          if (view instanceof ActWorkspaceView) await view.render();
+        });
+      });
+
+    new Setting(container)
+      .setName("隐藏已经全部完成的任务笔记")
       .setDesc("一篇任务笔记里的事全都做完后，就不再显示在「任务清单 · 今日」里，让列表更干净。关闭则一直显示。")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.hideCompletedNotes);
