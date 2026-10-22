@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "build": "node build.mjs",
-    "watch": "node_modules/.bin/esbuild main.ts --bundle --platform=browser --format=cjs --external:obsidian --outfile=main.js --watch"
+    "watch": "node_modules/.bin/esbuild main.ts --bundle --platform=browser --format=cjs --external:obsidian --outfile=main.js --watch",
+    "deploy": "node build.mjs && /bin/cp main.js styles.css manifest.json \"/Users/c1ay/C1ayWiki/.obsidian/plugins/act-workspace/\""
   },
   "repository": {
     "type": "git",

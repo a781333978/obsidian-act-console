@@ -922,7 +922,7 @@ interface ChildProcessLike {
 
 // 从命令模板里识别所选 CLI。用词边界匹配，这样模板中带不带 `--` 都能正确识别
 function detectSkillCli(template: string): { bin: "claude" | "codex"; label: string } {
-  return /(^|\s)claude(\s|$)/.test(template)
+  return /(^|\s)(claude|ca)(\s|$)/.test(template)
     ? { bin: "claude", label: "Claude Code" }
     : { bin: "codex", label: "Codex" };
 }
@@ -4139,11 +4139,24 @@ export default class ActWorkspacePlugin extends Plugin {
     if (!commands?.executeCommandById) return { ok: false, reason: "no-command-api" };
 
     // 返回可直接调用的 paste，避免可选属性在调用点反复收窄
-    const readyPaste = (leaf: WorkspaceLeaf | undefined): ((text: string) => void) | null => {
-      const termView = leaf?.view as unknown as { emulator?: { terminal?: { paste?: (text: string) => void } } } | undefined;
-      const terminal = termView?.emulator?.terminal;
+    // emulator 一出现 xterm 就能 paste，但此时 shell 进程可能还没接上（pseudoterminal 未 resolve），
+    // 粘进去的字会被直接丢掉 —— 表现为终端开了、命令没进去。所以先等 pseudoterminal 接好再粘
+    const readyPaste = (leaf: WorkspaceLeaf | undefined): ((text: string) => Promise<void>) | null => {
+      const termView = leaf?.view as unknown as {
+        emulator?: { terminal?: { paste?: (text: string) => void }; pseudoterminal?: Promise<unknown> };
+      } | undefined;
+      const emulator = termView?.emulator;
+      const terminal = emulator?.terminal;
       if (!terminal || typeof terminal.paste !== "function") return null;
-      return (text: string) => terminal.paste?.(text);
+      return async (text: string) => {
+        if (emulator?.pseudoterminal) {
+          await Promise.race([
+            emulator.pseudoterminal.catch(() => undefined),
+            new Promise((r) => setTimeout(r, TERMINAL_READY_TIMEOUT_MS)),
+          ]);
+        }
+        terminal.paste?.(text);
+      };
     };
 
     // 先记录已存在的终端，之后只认新出现的那个；否则命令可能被粘到之前留下的旧终端里
@@ -4159,7 +4172,7 @@ export default class ActWorkspacePlugin extends Plugin {
 
       const paste = readyPaste(fresh[fresh.length - 1]);
       if (paste) {
-        paste(command + "\n");
+        await paste(command + "\n");
         return { ok: true };
       }
 
@@ -4168,7 +4181,7 @@ export default class ActWorkspacePlugin extends Plugin {
       if (!sawNewLeaf && Date.now() > deadline - TERMINAL_READY_TIMEOUT_MS + TERMINAL_NEW_LEAF_GRACE_MS) {
         const reused = readyPaste(leaves[leaves.length - 1]);
         if (reused) {
-          reused(command + "\n");
+          await reused(command + "\n");
           return { ok: true };
         }
       }
@@ -4189,6 +4202,14 @@ export default class ActWorkspacePlugin extends Plugin {
     // 用 `--` 隔断，后面的内容一律按字面值传递。技能名本身不做改写 —— codex 是按文件夹名匹配技能的
     if (getRuntimePlatform() === "win32") {
       return `cd /d ${windowsCmdQuote(vaultPath)} && ${cli} -- ${windowsCmdQuote(skillName)}`;
+    }
+
+    // 模板里写了别的前置命令（如 `ponh; … ca -- {{skill}}` 先开代理、换账号）就按模板走，否则沿用固定格式
+    if (template.includes("{{skill}}") && !/^cd \{\{vault\}\} && (claude|codex) -- '\{\{skill\}\}'$/.test(template)) {
+      return template
+        .split("{{vault}}").join(shellQuote(vaultPath))
+        .split("'{{skill}}'").join(shellQuote(skillName))
+        .split("{{skill}}").join(shellQuote(skillName));
     }
 
     return `cd ${shellQuote(vaultPath)} && ${cli} -- ${shellQuote(skillName)}`;
