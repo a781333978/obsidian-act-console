@@ -4697,3 +4697,19 @@
 .act-update-notes-item {
   padding-left: 6px;
 }
+
+/* ===== flomo 待办导入按钮（本地改动） ===== */
+
+.act-section-tab-flomo {
+  font-size: 13px !important;
+  padding: 3px 8px !important;
+}
+
+.act-section-tab-flomo:hover {
+  background: var(--act-card-dark) !important;
+}
+
+.act-action-flomo-btn {
+  margin-left: auto;
+  margin-right: 4px;
+}

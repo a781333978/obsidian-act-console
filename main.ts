@@ -98,6 +98,7 @@ type ProgressLogFormat = "heading-time" | "bullet-time";
 type CompletedLogTarget = "weekly" | "daily" | "custom";
 
 const QUICK_SKILLS: SkillShortcut[] = [];
+const FLOMO_IMPORT_SKILL = "-ACT-flomo待办导入";
 
 /* ========= THEME ========= */
 
@@ -1529,6 +1530,8 @@ class ActWorkspaceView extends ItemView {
 
     const addBtn = tabBar.createEl("button", { text: "+", cls: "act-section-tab act-section-tab-add", attr: { type: "button" } });
     addBtn.addEventListener("click", () => this.createFocusTaskNote(current));
+    const flomoBtn = tabBar.createEl("button", { text: "📥", cls: "act-section-tab act-section-tab-flomo", attr: { type: "button", "aria-label": "从 flomo 导入待办", title: "从 flomo 导入待办（和已有待办对照，重复的合并）" } });
+    flomoBtn.addEventListener("click", () => this.plugin.importFlomoTodos());
 
     const folder = this.app.vault.getAbstractFileByPath(current.folder);
     if (!(folder instanceof TFolder)) {
@@ -1786,6 +1789,9 @@ class ActWorkspaceView extends ItemView {
   private renderActionTaskList(container: HTMLElement, tasks: ActionTask[]) {
     const headerRow = container.createDiv({ cls: "act-action-list-header" });
     headerRow.createEl("h2", { text: "任务列表", cls: "act-section-title" });
+    const flomoBtn = headerRow.createEl("button", { cls: "act-action-add-btn act-action-flomo-btn", attr: { type: "button", "aria-label": "从 flomo 导入待办", title: "从 flomo 导入待办（和已有待办对照，重复的合并）" } });
+    setIcon(flomoBtn, "inbox");
+    flomoBtn.addEventListener("click", () => this.plugin.importFlomoTodos());
     const addBtn = headerRow.createEl("button", { cls: "act-action-add-btn", attr: { type: "button", "aria-label": "新建任务笔记" } });
     setIcon(addBtn, "plus");
     addBtn.addEventListener("click", () => this.createActionTaskNote());
@@ -4102,6 +4108,26 @@ export default class ActWorkspacePlugin extends Plugin {
     if (opened === false || !commands?.executeCommandById) {
       new Notice("请先启用 ACT 闪念簿 插件");
     }
+  }
+
+  // flomo 待办导入：判断重复 / 合并要靠 AI，所以交给 Skill 做。优先开 Agent Bridge 侧边栏（能直接回复「确认」），
+  // 没装 Agent Bridge 就退回终端跑 Skill
+  async importFlomoTodos() {
+    const skillPath = `.claude/skills/${FLOMO_IMPORT_SKILL}/SKILL.md`;
+    const bridge = (this.app as App & { plugins?: { getPlugin?: (id: string) => { api?: { startSession?: (o: Record<string, unknown>) => Promise<boolean> } } | null } })
+      .plugins?.getPlugin?.("agent-bridge")?.api;
+    if (bridge?.startSession) {
+      const ok = await bridge.startSession({
+        title: "从 flomo 导入待办",
+        prompt: "导入 flomo 待办：读 flomo 里还没导入的 #待办，和 10-Action 已有行动项对照，先给我编号方案，我确认后再写入。",
+        skill: (await this.app.vault.adapter.exists(skillPath)) ? skillPath : undefined,
+        quickReplies: ["确认", "全部跳过"],
+        writable: true,
+        send: true,
+      });
+      if (ok) return;
+    }
+    await this.openSkillInTerminal(FLOMO_IMPORT_SKILL);
   }
 
   async openSkillInTerminal(skillName: string) {
